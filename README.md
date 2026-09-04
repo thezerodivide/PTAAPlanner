@@ -1,269 +1,191 @@
-# Project Triune AA Planner
+# PTAAPlanner
 
-AA Planner is a standalone MacroQuest Lua utility for building, saving, sharing, and applying prioritized [MQ2AASpend](https://github.com/RedGuides/MQ2AASpend) lists on the [Project Triune](https://nms.bestemu.com/) EverQuest server.
+PTAAPlanner is a Project Triune AA planning tool for MacroQuest.
 
-Project Triune characters combine three classes, which makes planning Alternate Advancement progression considerably more involved than it is for a standard character. AA Planner reads the abilities exposed by the current character, organizes them by AA tab, and provides a visual interface for choosing both purchase order and target rank.
-
-## Features
-
-- Automatically detects all three Project Triune classes
-- Provides manual three-class selection if autodetection fails
-- Reads available AAs from the current character and in-game AA window
-- Organizes abilities into General, Archetype, and Class tabs
-- Displays current rank, maximum rank, and next-rank cost
-- Searches AAs by name
-- Optionally hides fully trained abilities
-- Supports a specific target rank or `M` for the maximum available rank
-- Reorders purchase priorities with Up and Down controls
-- Saves and loads named AA plans
-- Automatically preserves the current working list between sessions
-- Imports and exports shareable AA Planner lists
-- Imports and exports MQ2AASpend-compatible entries
-- Replaces only the MQ2AASpend AA-list section
-- Preserves bank, brute-force, and other MQ2AASpend settings
-- Creates a timestamped backup before modifying an existing character INI
-- Loads MQ2AASpend automatically when Auto Spend is enabled
+It allows you to build a prioritized AA purchase list and hand that list off to MQ2AASpend for automatic purchasing.
 
 ## Requirements
 
-- [Latest version of MacroQuest](https://github.com/macroquest/macroquest/releases), including Lua and ImGui support
-- [MQ2AASpend](https://github.com/RedGuides/MQ2AASpend)
-- A Project Triune character
+- Project Triune
+- Latest MacroQuest RoF2 build
+- PTAAPlanner Lua script
+- Triune-compatible MQ2AASpend build included with this repository
 
 ## Installation
 
-1. Download `aaplanner.lua`.
-2. Copy it into the `lua` directory inside your MacroQuest installation.
-3. Log into the Project Triune character whose AA plan you want to manage.
-4. Run:
+For most users, download the latest release ZIP and extract the files into your MacroQuest directory.
+
+The release ZIP includes:
+
+- `aaplanner.lua`
+- `MQ2AASpend.dll`
+
+Place them in the appropriate MacroQuest folders if installing manually:
+
+```text
+aaplanner.lua
+-> MacroQuest\lua\
+
+MQ2AASpend.dll
+-> MacroQuest\plugins\
+```
+
+## Usage
+
+Run PTAAPlanner with:
 
 ```text
 /lua run aaplanner
 ```
 
-The planner may briefly open the Inventory and Alternate Advancement windows while detecting classes and scanning available abilities. Windows opened by the planner are closed again after the scan.
+Use the PTAAPlanner window to select and prioritize the AAs you want to purchase.
 
-## Quick Start
+When your list is ready:
 
-1. Confirm that the three detected classes shown at the top of the window are correct.
-2. Choose the General, Archetype, or Class tab.
-3. Search or browse for an AA.
-4. Click **Add** to place it at the end of the priority list.
-5. Set its target rank, or enter `M` to train all available ranks.
-6. Use **Up** and **Down** to arrange the purchase order.
-7. Click **Write MQ2AASpend List**.
-8. Click **Enable Auto Spend** when you are ready to activate the list.
+1. Click **Write MQ2AASpend List**
+2. Click **Enable Auto Spend**
 
-## Class Detection
+PTAAPlanner will write the selected AAs into the MQ2AASpend configuration and enable automatic AA spending.
 
-AA Planner attempts to read all three classes from Project Triune's Inventory window. When detection succeeds, the class row is marked **Detected**.
+## Project Triune MQ2AASpend Compatibility
 
-If the server UI or a custom UI prevents detection, use the three class selectors manually. A manually selected combination is saved and restored the next time the planner runs.
+PTAAPlanner uses MQ2AASpend to perform the actual AA purchases.
 
-Click **Re-detect** at any time to retry automatic detection.
-
-## Building a Priority List
-
-The left side of the planner contains the AA catalog. Abilities are grouped according to the tabs in EverQuest's Alternate Advancement window:
-
-- **General**
-- **Archetype**
-- **Class**
-
-The right side contains the purchase-priority list. MQ2AASpend evaluates this list from top to bottom.
-
-Each entry has a target-rank field:
-
-- Enter a positive whole number such as `3`, `7`, or `10` to stop purchasing after that rank.
-- Enter `M` to purchase every rank available to the character.
-
-An AA can appear only once in the working list.
-
-## Writing the MQ2AASpend List
-
-Click **Write MQ2AASpend List** to write the current priorities into the character's MacroQuest INI file:
+The standard MQ2AASpend plugin assumes that an Alternate Advancement ability is fully trained when its MacroQuest AA data reports:
 
 ```text
-MacroQuest/config/<Server>_<Character>.ini
+CurrentRank == MaxRank
 ```
 
-Only this section is replaced:
+Project Triune does not always expose AA rank data this way.
 
-```ini
-[MQ2AASpend_AAList]
-0=Combat Agility|10
-1=Combat Stability|M
-2=Spell Casting Fury|3
-```
-
-The numeric keys begin at `0`, and their order defines the purchase priority.
-
-The planner preserves every other section in the character INI, including MQ2AASpend's Auto Spend, Brute Force, bank, and tab-order settings.
-
-Before changing an existing INI, the planner creates a timestamped backup beside it:
+For example, an untrained single-rank ability may appear in the EverQuest AA window as:
 
 ```text
-<Server>_<Character>.ini.aaplanner_backup_YYYYMMDD_HHMMSS
+0/1
 ```
 
-Writing the list does not enable automatic spending.
-
-## Enabling Auto Spend
-
-Click **Enable Auto Spend** to activate the written list.
-
-If MQ2AASpend is not loaded, the planner runs:
+while MacroQuest reports the corresponding AA record as:
 
 ```text
-/plugin mq2aaspend load
+CurrentRank = 1
+MaxRank = 1
 ```
 
-It then runs:
+The upstream MQ2AASpend logic can therefore incorrectly classify some available Project Triune AAs as already maxed and skip them.
+
+## Included Triune-Compatible MQ2AASpend
+
+This repository includes a modified version of `MQ2AASpend.cpp` designed to work correctly with Project Triune's AA data.
+
+Instead of using:
+
+```cpp
+CurrentRank == MaxRank
+```
+
+as the authoritative indication that an AA is complete, the modified version relies on MacroQuest's:
+
+```cpp
+pAltAdvManager->CanTrainAbility(...)
+```
+
+check to determine whether the candidate AA rank can actually be purchased.
+
+This preserves normal MQ2AASpend priority-list behavior while correctly handling Project Triune AA records.
+
+The modified version has been tested with:
+
+- Untrained single-rank abilities
+- Partially trained multi-rank abilities
+- Fully trained abilities
+- Abilities blocked by level or prerequisites
+- PTAAPlanner-generated AA lists
+
+All tested cases behaved as expected.
+
+## Building MQ2AASpend for Project Triune
+
+Most users do not need to build MQ2AASpend themselves. A precompiled `MQ2AASpend.dll` is included in the release ZIP.
+
+If you prefer to build it from source, clone the MacroQuest repository:
+
+```powershell
+git clone https://github.com/macroquest/macroquest.git
+cd macroquest
+git submodule init
+git submodule update
+```
+
+Switch `eqlib` to the RoF2 emulator branch:
+
+```powershell
+git -C src\eqlib checkout emu-rof2
+```
+
+Verify the branch:
+
+```powershell
+git -C src\eqlib branch --show-current
+```
+
+It should report:
 
 ```text
-/aaspend load
-/aaspend auto on
+emu-rof2
 ```
 
-This reloads the character INI and enables MQ2AASpend's list-based Auto mode. It does not change the bank value, Brute Force mode, or other plugin settings.
+Generate the MQ2AASpend plugin project:
 
-## Saving Plans
+```powershell
+cd plugins
+.\mkplugin.exe MQ2AASpend
+```
 
-Enter a name in the **Saved-list name** field and click **Save Current** to create a named plan.
+Add the generated `MQ2AASpend.vcxproj` to the MacroQuest solution.
 
-Saved plans can be loaded or deleted from the dropdown below the name field. Saving under an existing name replaces that saved plan.
+Replace the generated `MQ2AASpend.cpp` with the Triune-compatible version included in this repository.
 
-AA Planner stores its working list, named plans, and last selected classes in:
+Build using:
 
 ```text
-MacroQuest/config/aaplanner_lists.lua
+Configuration: Release
+Platform: Win32
 ```
 
-This file belongs to AA Planner and is separate from the MQ2AASpend character INI.
-
-## Import and Export
-
-Click **Import / Export** to open the transfer window.
-
-### AA Planner format
-
-**Copy Planner Format** places a shareable list on the clipboard. This format retains the AA tab as well as the name and target rank.
-
-Example:
+The resulting plugin DLL will normally be written to:
 
 ```text
-AAPLANNER1
-Combat Agility|10|General
-Combat Stability|M|General
-Spell Casting Fury|3|Archetype
+macroquest\build\bin\release\plugins\MQ2AASpend.dll
 ```
 
-### MQ2AASpend format
+Copy that DLL into the `plugins` directory of the MacroQuest installation you use for Project Triune.
 
-**Copy MQ2AASpend INI** copies a ready-to-use section:
+## Testing MQ2AASpend
 
-```ini
-[MQ2AASpend_AAList]
-0=Combat Agility|10
-1=Combat Stability|M
-2=Spell Casting Fury|3
-```
+MQ2AASpend includes a debug mode that runs its AA-selection logic without actually issuing the purchase command.
 
-The importer accepts:
-
-- AA Planner exports beginning with `AAPLANNER1`
-- A complete `[MQ2AASpend_AAList]` section
-- Individual `Name|Rank` entries
-
-Importing replaces the planner's current working list. It does not modify the MQ2AASpend character INI until **Write MQ2AASpend List** is clicked.
-
-## Commands
-
-| Command | Description |
-| --- | --- |
-| `/aaplanner` | Opens the planner or displays command help when given an unknown option |
-| `/aaplanner show` | Opens the planner window |
-| `/aaplanner refresh` | Rescans the current character's available AAs |
-| `/aaplanner debug` | Prints class, catalog, AA-window, INI-path, and plugin diagnostics |
-| `/aaplanner quit` | Saves the working state and stops the Lua script |
-
-You can also stop it with MacroQuest's standard command:
-
-```text
-/lua stop aaplanner
-```
-
-## Safely Testing a New List
-
-MQ2AASpend has a debug mode that performs its normal checks and reports what it would purchase without sending the purchase command.
-
-After writing and enabling a small test list, run:
+You can test your generated list with:
 
 ```text
 /aaspend debug on
 /aaspend auto now
 ```
 
-Review the MQ console output and confirm that MQ2AASpend selects the expected AA. When satisfied, disable debug mode:
+Review the output to confirm that the expected AA is selected.
+
+When you are satisfied:
 
 ```text
 /aaspend debug off
 ```
 
-You can inspect the plugin's current configuration with:
+The plugin can then be used normally with PTAAPlanner's **Enable Auto Spend** button.
 
-```text
-/aaspend status
-```
+## Upstream MQ2AASpend
 
-## Troubleshooting
+MQ2AASpend is originally developed and maintained by RedGuides:
 
-### AAs are missing from the catalog
+https://github.com/RedGuides/MQ2AASpend
 
-1. Open EverQuest's Alternate Advancement window.
-2. Select the tab containing the missing ability.
-3. Click **Refresh Catalog** or run `/aaplanner refresh`.
-4. Run `/aaplanner debug` if the ability is still absent.
-
-Include the resulting `[AA Planner Debug]` lines when reporting the problem. They show which AA window was detected and how many controls, lists, rows, and cells were inspected.
-
-### Classes were not detected
-
-Use the three manual class selectors, then try **Re-detect** with the Inventory window open. If detection still fails, include `/aaplanner debug` output in the report.
-
-### MQ2AASpend does not load
-
-Confirm that MQ2AASpend is installed for the same MacroQuest build you are running. The planner will report an error if `/plugin mq2aaspend load` does not make the plugin available.
-
-### The wrong AA would be purchased
-
-Keep MQ2AASpend debug mode enabled while testing:
-
-```text
-/aaspend debug on
-/aaspend auto now
-```
-
-Then check:
-
-- The order shown in the planner
-- The target rank assigned to each AA
-- `/aaspend status`
-- The `[MQ2AASpend_AAList]` section in the character INI
-
-## Updating
-
-To update AA Planner:
-
-1. Stop the running script with `/lua stop aaplanner`.
-2. Replace the existing `aaplanner.lua` file with the new version.
-3. Run `/lua run aaplanner` again.
-
-Your working list and named plans are stored separately in `aaplanner_lists.lua` and are not overwritten when the main Lua file is replaced.
-
-## Acknowledgements
-
-- [MacroQuest](https://github.com/macroquest/macroquest) for its Lua, ImGui, TLO, and plugin interfaces
-- [MQ2AASpend](https://github.com/RedGuides/MQ2AASpend) for automatic AA purchasing and its ordered INI format
-- [TriuneAutocombat](https://github.com/gennro/TriuneAutocombat) for Project Triune UI and class-detection reference behavior
-- [Project Triune](https://nms.bestemu.com/) for the three-class EverQuest environment this utility supports
+This repository only carries the Project Triune compatibility modification required for the AA data exposed by Triune.
