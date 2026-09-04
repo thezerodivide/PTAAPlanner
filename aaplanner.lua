@@ -8,7 +8,7 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local APP_NAME = 'Project Triune AA Planner'
-local VERSION = '0.1.0'
+local VERSION = '0.1.3'
 local open = true
 
 local configDir = mq.configDir
@@ -58,6 +58,14 @@ local state = {
     applyRequested = false,
     enableRequested = false,
     dirty = false,
+    planApplied = false,
+    autoManageActive = false,
+    aaPoints = 0,
+    queueCost = 0,
+    queueCostComplete = true,
+    bankTarget = 0,
+    maintenanceAt = 0,
+    syncRequested = false,
     scanStats = { window = 'none', listControls = 0, rows = 0, cells = 0 },
 }
 
@@ -137,6 +145,12 @@ local function markDirty()
     state.dirty = true
 end
 
+local function markPlanDirty()
+    state.dirty = true
+    state.planApplied = false
+    state.autoManageActive = false
+end
+
 local function normalizeClass(text)
     local value = trim(text):upper():gsub('[%s_%-]', '')
     if value == '' then return nil end
@@ -212,6 +226,182 @@ local function safeAAValue(aa, member, default)
         end
     end)
     return value
+end
+
+local function getCurrentAAPoints()
+    local points = 0
+    pcall(function() points = tonumber(mq.TLO.Me.AAPoints() or 0) or 0 end)
+    return points
+end
+
+local function getAAProgress(name)
+    local personal = mq.TLO.Me.AltAbility(name)
+    local global = mq.TLO.AltAbility(name)
+    local rank = tonumber(safeAAValue(personal, 'Rank', 0)) or 0
+    local maxRank = tonumber(safeAAValue(personal, 'MaxRank', 0)) or 0
+    if maxRank <= 0 then maxRank = tonumber(safeAAValue(global, 'MaxRank', 0)) or 0 end
+    local cost = tonumber(safeAAValue(personal, 'Cost', 0)) or 0
+    if cost <= 0 then cost = tonumber(safeAAValue(global, 'Cost', 0)) or 0 end
+    return rank, maxRank, cost
+end
+
+local function getEntryTarget(entry, maxRank)
+    if tostring(entry.rank):upper() == 'M' then return tonumber(maxRank) or 0 end
+    return tonumber(entry.rank) or 0
+end
+
+local function isEntryComplete(entry)
+    local rank, maxRank = getAAProgress(entry.name)
+    local target = getEntryTarget(entry, maxRank)
+    return target > 0 and rank >= target
+end
+
+local aaCostCache = {
+    path = nil,
+    mtime = nil,
+    loadedAt = 0,
+    entries = {},
+}
+
+local function getAACostCachePath()
+    local character = trim(mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or '')
+    local server = ''
+    pcall(function() server = trim(mq.TLO.MacroQuest.Server() or '') end)
+    if server == '' then pcall(function() server = trim(mq.parse('${MacroQuest.Server}')) end) end
+    if character == '' or server == '' or server == 'NULL' then return nil end
+    local separator = configDir:sub(-1) == '\\' or configDir:sub(-1) == '/'
+    if separator then
+        return configDir .. string.format('MQ2AASpend_%s_%s_costs.txt', server, character)
+    end
+    return configDir .. '\\' .. string.format('MQ2AASpend_%s_%s_costs.txt', server, character)
+end
+
+local function loadAACostCache(force)
+    local path = getAACostCachePath()
+    if not path then return end
+
+    local now = os.time()
+    if not force and aaCostCache.path == path and (now - aaCostCache.loadedAt) < 2 then
+        return
+    end
+
+    aaCostCache.path = path
+    aaCostCache.loadedAt = now
+    aaCostCache.entries = {}
+
+    local file = io.open(path, 'rb')
+    if not file then return end
+
+    for line in file:lines() do
+        if line:sub(1, 1) ~= '#' then
+            local name, encoded = line:match('^(.-)|(.*)$')
+            if name and encoded then
+                local costs = {}
+                for rank, cost in encoded:gmatch('(%d+)=(-?%d+)') do
+                    costs[tonumber(rank)] = tonumber(cost)
+                end
+                aaCostCache.entries[name] = costs
+            end
+        end
+    end
+
+    file:close()
+end
+
+local function refreshAACostCache()
+    local loaded = false
+    pcall(function()
+        loaded = mq.TLO.Plugin('MQ2AASpend').IsLoaded()
+    end)
+
+    if loaded then
+        mq.cmd('/aaspend costcache')
+        mq.delay(150)
+    end
+
+    loadAACostCache(true)
+end
+
+local function getRankCostMap(name)
+    loadAACostCache(false)
+
+    local cached = aaCostCache.entries[name]
+    if cached then
+        local copy = {}
+        for rank, cost in pairs(cached) do copy[rank] = cost end
+        return copy
+    end
+
+    -- Fallback for a missing/stale cache: at least preserve the rank/cost
+    -- currently exposed by the Lua TLO. The UI will explicitly mark totals
+    -- unresolved rather than pretending this is a complete multi-rank total.
+    local costs = {}
+    local ability = mq.TLO.AltAbility(name)
+    local rank = tonumber(safeAAValue(ability, 'Rank', 0)) or 0
+    local cost = tonumber(safeAAValue(ability, 'Cost', 0)) or 0
+    if rank > 0 then costs[rank] = cost end
+    return costs
+end
+
+local function remainingCostForEntry(entry)
+    local rank, maxRank, nextCost = getAAProgress(entry.name)
+    local target = getEntryTarget(entry, maxRank)
+    if target <= 0 or rank >= target then return 0, true end
+
+    local costs = getRankCostMap(entry.name)
+    local total = 0
+    local complete = true
+    for wanted = rank + 1, target do
+        local cost = costs[wanted]
+        if cost == nil and wanted == rank + 1 and nextCost > 0 then cost = nextCost end
+        if cost == nil then
+            complete = false
+        else
+            total = total + cost
+        end
+    end
+    return total, complete
+end
+
+local function recalculatePlannerStats()
+    state.aaPoints = getCurrentAAPoints()
+    local total = 0
+    local complete = true
+    for _, entry in ipairs(state.plan) do
+        local cost, resolved = remainingCostForEntry(entry)
+        total = total + cost
+        if not resolved then complete = false end
+    end
+    state.queueCost = total
+    state.queueCostComplete = complete
+end
+
+local function getTopPriorityCost()
+    for _, entry in ipairs(state.plan) do
+        local rank, maxRank, cost = getAAProgress(entry.name)
+        local target = getEntryTarget(entry, maxRank)
+        if target > 0 and rank < target then
+            return math.max(0, tonumber(cost) or 0), entry.name, rank, target
+        end
+    end
+    return 0, nil, 0, 0
+end
+
+local function pruneCompletedPlan()
+    local removed = {}
+    for i = #state.plan, 1, -1 do
+        if isEntryComplete(state.plan[i]) then
+            table.insert(removed, 1, state.plan[i].name)
+            table.remove(state.plan, i)
+        end
+    end
+    if #removed > 0 then
+        state.dirty = true
+        if state.autoManageActive then state.syncRequested = true end
+        print(string.format('\at[AA Planner]\ax Removed completed AA%s from priority list: %s',
+            #removed == 1 and '' or 's', table.concat(removed, ', ')))
+    end
+    return #removed
 end
 
 local function recordAA(name, forcedTab)
@@ -396,14 +586,14 @@ local function addToPlan(aa)
     end
     local target = aa.maxRank > 0 and tostring(aa.maxRank) or 'M'
     state.plan[#state.plan + 1] = { name = aa.name, rank = target, tab = aa.tab }
-    markDirty()
+    markPlanDirty()
 end
 
 local function movePlan(index, delta)
     local target = index + delta
     if target < 1 or target > #state.plan then return end
     state.plan[index], state.plan[target] = state.plan[target], state.plan[index]
-    markDirty()
+    markPlanDirty()
 end
 
 local function encodeField(value)
@@ -499,6 +689,71 @@ local function getCharacterINIPath()
     return pathJoin(configDir, server .. '_' .. character .. '.ini')
 end
 
+local function getDebugLogPath()
+    local character = trim(mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or '')
+    local server = ''
+    pcall(function() server = trim(mq.TLO.MacroQuest.Server() or '') end)
+    if server == '' then pcall(function() server = trim(mq.parse('${MacroQuest.Server}')) end) end
+    if character == '' or server == '' or server == 'NULL' then return nil end
+    return pathJoin(configDir, string.format('MQ2AASpend_%s_%s_debug.log', server, character))
+end
+
+local function appendSupportLog(line)
+    local path = getDebugLogPath()
+    if not path then return false end
+
+    local file = io.open(path, 'ab')
+    if not file then return false end
+
+    file:write(string.format('[%s] %s\r\n', os.date('%Y-%m-%d %H:%M:%S'), tostring(line)))
+    file:close()
+    return true
+end
+
+local function writePrioritySnapshot(reason)
+    recalculatePlannerStats()
+
+    local iniPath = select(1, getCharacterINIPath()) or 'unknown'
+    appendSupportLog(string.format(
+        '[PTAAPlanner] Priority snapshot (%s) Version=%s Entries=%d AAPoints=%d QueueCost=%d QueueCostComplete=%s DynamicBank=%d INI=%s',
+        tostring(reason or 'update'), VERSION, #state.plan, tonumber(state.aaPoints or 0),
+        tonumber(state.queueCost or 0), tostring(state.queueCostComplete),
+        tonumber(state.bankTarget or 0), tostring(iniPath)))
+
+    if #state.plan == 0 then
+        appendSupportLog('[PTAAPlanner] Priority list is empty.')
+        return
+    end
+
+    for i, entry in ipairs(state.plan) do
+        local currentRank, maxRank, nextCost = getAAProgress(entry.name)
+        local target = getEntryTarget(entry, maxRank)
+        local remainingCost, resolved = remainingCostForEntry(entry)
+        appendSupportLog(string.format(
+            '[PTAAPlanner] #%d %s | Target=%s | Current=%d/%d | NextCost=%d | RemainingCost=%d | CostResolved=%s',
+            i, tostring(entry.name), tostring(entry.rank), tonumber(currentRank or 0),
+            tonumber(maxRank or 0), tonumber(nextCost or 0), tonumber(remainingCost or 0),
+            tostring(resolved)))
+
+        if not resolved then
+            local rankCosts = getRankCostMap(entry.name)
+            local parts = {}
+            for rank = 1, tonumber(maxRank or 0) do
+                if rankCosts[rank] ~= nil then
+                    parts[#parts + 1] = string.format('R%d=%d', rank, rankCosts[rank])
+                end
+            end
+            local cachePresent = aaCostCache.entries[entry.name] ~= nil
+            appendSupportLog(string.format(
+                '[PTAAPlanner] COST DEBUG %s | Group=%d | CachePresent=%s | KnownRankCosts=%s',
+                tostring(entry.name),
+                tonumber(safeAAValue(mq.TLO.AltAbility(entry.name), 'GroupID', 0)) or 0,
+                tostring(cachePresent),
+                #parts > 0 and table.concat(parts, ',') or 'none'))
+        end
+    end
+end
+
 local function readFile(path)
     local file = io.open(path, 'rb')
     if not file then return '' end
@@ -545,11 +800,31 @@ local function replaceINISection(content, sectionName, replacement)
     return result .. newline
 end
 
-local function applyPlanToINI()
-    if #state.plan == 0 then
-        setStatus('The priority list is empty; nothing was written.', 'warn')
-        return
+
+local function syncDynamicBank(force)
+    if not pluginLoaded() or not state.autoManageActive then return end
+    local cost, name = getTopPriorityCost()
+    cost = math.max(0, math.floor(tonumber(cost) or 0))
+    if force or cost ~= state.bankTarget then
+        mq.cmd(string.format('/aaspend bank %d', cost))
+        state.bankTarget = cost
+        if name then
+            print(string.format('\at[AA Planner]\ax Dynamic bank set to %d AA for next priority: %s.', cost, name))
+        else
+            print('\at[AA Planner]\ax Priority list complete; dynamic bank reset to 0.')
+        end
     end
+end
+
+local function applyPlanToINI(createBackup, announce, allowEmpty)
+    refreshAACostCache()
+    if #state.plan == 0 and not allowEmpty then
+        setStatus('The priority list is empty; nothing was written.', 'warn')
+        return false
+    end
+
+    if createBackup == nil then createBackup = true end
+    if announce == nil then announce = true end
 
     if pluginLoaded() then
         mq.cmd('/aaspend save')
@@ -557,22 +832,46 @@ local function applyPlanToINI()
     end
 
     local path, pathErr = getCharacterINIPath()
-    if not path then setStatus(pathErr, 'error'); return end
+    if not path then
+        if announce then setStatus(pathErr, 'error') end
+        return false
+    end
+
     local original = readFile(path)
-    if original ~= '' then
+    if createBackup and original ~= '' then
         local stamp = os.date('%Y%m%d_%H%M%S')
         local backupPath = path .. '.aaplanner_backup_' .. stamp
         local backupOK, backupErr = writeFile(backupPath, original)
         if not backupOK then
-            setStatus('Could not create the safety backup: ' .. tostring(backupErr), 'error')
-            return
+            if announce then setStatus('Could not create the safety backup: ' .. tostring(backupErr), 'error') end
+            return false
         end
     end
 
     local updated = replaceINISection(original, 'MQ2AASpend_AAList', exportINISection())
     local ok, err = writeFile(path, updated)
-    if not ok then setStatus('Could not write MQ2AASpend list: ' .. tostring(err), 'error'); return end
-    setStatus(string.format('Wrote %d prioritized AAs to %s. Other INI sections were preserved.', #state.plan, path), 'good')
+    if not ok then
+        if announce then setStatus('Could not write MQ2AASpend list: ' .. tostring(err), 'error') end
+        return false
+    end
+
+    state.planApplied = true
+    state.autoManageActive = true
+
+    -- Always refresh the plugin after writing so its in-memory priority list
+    -- immediately matches the file PTAAPlanner just changed.
+    if pluginLoaded() then
+        mq.cmd('/aaspend load')
+        mq.delay(150)
+        syncDynamicBank(true)
+    end
+
+    writePrioritySnapshot(createBackup and 'manual list write' or 'automatic priority update')
+
+    if announce then
+        setStatus(string.format('Wrote %d prioritized AAs to %s. Other INI sections were preserved.', #state.plan, path), 'good')
+    end
+    return true
 end
 
 local function enableAutoSpend()
@@ -585,10 +884,19 @@ local function enableAutoSpend()
         setStatus('MQ2AASpend did not load. Confirm MQ2AASpend.dll is installed.', 'error')
         return
     end
+
     mq.cmd('/aaspend load')
     mq.delay(150)
+    state.autoManageActive = true
+
+    -- Enable Auto Spend first. The Triune MQ2AASpend build will immediately
+    -- schedule a purchase pass if the dynamic bank threshold is already met.
     mq.cmd('/aaspend auto on')
-    setStatus('MQ2AASpend loaded the list and Auto Spend was enabled.', 'good')
+    mq.delay(100)
+    syncDynamicBank(true)
+    writePrioritySnapshot('auto spend enabled')
+
+    setStatus('MQ2AASpend loaded the list, Auto Spend was enabled, and dynamic banking was updated.', 'good')
 end
 
 local function sortedSavedNames()
@@ -662,7 +970,18 @@ end
 local function drawPriorityList()
     ImGui.Text(string.format('Purchase Priority (%d)', #state.plan))
     ImGui.SameLine()
-    if ImGui.Button('Clear All') then state.plan = {}; markDirty() end
+    if ImGui.Button('Clear All') then state.plan = {}; markPlanDirty() end
+
+    ImGui.Text(string.format('Unspent AA Points: %d', state.aaPoints or 0))
+    local costLabel = state.queueCostComplete and
+        string.format('Priority List Cost: %d AA', state.queueCost or 0) or
+        string.format('Priority List Cost: at least %d AA (some future rank costs unresolved)', state.queueCost or 0)
+    ImGui.Text(costLabel)
+    local needed = math.max(0, (state.queueCost or 0) - (state.aaPoints or 0))
+    ImGui.Text(string.format('Additional AA Needed: %d', needed))
+    if state.autoManageActive then
+        ImGui.TextDisabled(string.format('Dynamic Bank: %d', state.bankTarget or 0))
+    end
     ImGui.Separator()
     if ImGui.BeginChild('priority_list', 0, 390, true) then
         for i, entry in ipairs(state.plan) do
@@ -673,12 +992,12 @@ local function drawPriorityList()
             ImGui.SameLine()
             if ImGui.SmallButton('Down') then movePlan(i, 1) end
             ImGui.SameLine()
-            if ImGui.SmallButton('Remove') then table.remove(state.plan, i); markDirty(); ImGui.PopID(); break end
+            if ImGui.SmallButton('Remove') then table.remove(state.plan, i); markPlanDirty(); ImGui.PopID(); break end
             ImGui.SameLine()
             ImGui.SetNextItemWidth(68)
             local rankValue = ImGui.InputText('##rank', tostring(entry.rank), 8)
             rankValue = trim(rankValue):upper()
-            if rankValue ~= entry.rank and validateRank(rankValue) then entry.rank = validateRank(rankValue); markDirty() end
+            if rankValue ~= entry.rank and validateRank(rankValue) then entry.rank = validateRank(rankValue); markPlanDirty() end
             if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', 'Target rank, or M for maximum available rank.') end
             ImGui.SameLine()
             local tabLabel = TAB_NAMES[entry.tab] or 'Unknown'
@@ -722,7 +1041,7 @@ local function drawSaveControls()
         ImGui.SameLine()
         if ImGui.Button('Load Saved') then
             state.plan = copyPlan(state.savedLists[state.selectedSaved])
-            markDirty()
+            markPlanDirty()
             setStatus('Loaded saved list: ' .. state.selectedSaved, 'good')
         end
         ImGui.SameLine()
@@ -769,7 +1088,7 @@ local function drawTransferWindow()
             local imported, err = parseImport(state.importText)
             if imported then
                 state.plan = imported
-                markDirty()
+                markPlanDirty()
                 state.showTransfer = false
                 setStatus(string.format('Imported %d AA priorities.', #imported), 'good')
             else setStatus(err, 'error') end
@@ -826,12 +1145,16 @@ local function drawMainWindow()
 end
 
 loadSavedData()
+refreshAACostCache()
+recalculatePlannerStats()
 
 mq.bind('/aaplanner', function(command)
     command = trim(command):lower()
     if command == 'quit' or command == 'exit' then open = false
-    elseif command == 'refresh' then state.scanRequested = true
+    elseif command == 'refresh' then refreshAACostCache(); state.scanRequested = true
     elseif command == 'debug' then
+        refreshAACostCache()
+        recalculatePlannerStats()
         local counts = { 0, 0, 0 }
         for _, aa in ipairs(state.catalog) do
             if counts[aa.tab] then counts[aa.tab] = counts[aa.tab] + 1 end
@@ -847,6 +1170,12 @@ mq.bind('/aaplanner', function(command)
             tonumber(state.scanStats.cells or 0)))
         print(string.format('\at[AA Planner Debug]\ax ConfigDir=%s INI=%s',
             tostring(configDir), tostring(iniPath or iniErr)))
+        print(string.format('\at[AA Planner Debug]\ax AAPoints=%d QueueCost=%d QueueCostComplete=%s DynamicBank=%d AutoManage=%s',
+            tonumber(state.aaPoints or 0), tonumber(state.queueCost or 0), tostring(state.queueCostComplete),
+            tonumber(state.bankTarget or 0), tostring(state.autoManageActive)))
+        writePrioritySnapshot('/aaplanner debug')
+        print(string.format('\at[AA Planner Debug]\ax Priority snapshot appended to %s',
+            tostring(getDebugLogPath() or 'debug log unavailable')))
     elseif command == 'show' or command == '' then open = true
     else print('\at[AA Planner]\ax /aaplanner [show|refresh|debug|quit]') end
 end)
@@ -856,8 +1185,23 @@ mq.imgui.init('AAPlanner', drawMainWindow)
 while open do
     if state.detectRequested then state.detectRequested = false; detectClasses() end
     if state.scanRequested then state.scanRequested = false; refreshCatalog() end
-    if state.applyRequested then state.applyRequested = false; applyPlanToINI() end
+    if state.applyRequested then state.applyRequested = false; applyPlanToINI(true, true, false) end
     if state.enableRequested then state.enableRequested = false; enableAutoSpend() end
+
+    local now = os.time()
+    if now ~= state.maintenanceAt then
+        state.maintenanceAt = now
+        pruneCompletedPlan()
+        recalculatePlannerStats()
+
+        if state.syncRequested and state.autoManageActive then
+            state.syncRequested = false
+            applyPlanToINI(false, false, true)
+        elseif state.autoManageActive then
+            syncDynamicBank(false)
+        end
+    end
+
     if state.dirty then
         -- Debouncing is unnecessary at this scale; persisting here protects the
         -- working list if EQ or MacroQuest closes unexpectedly.

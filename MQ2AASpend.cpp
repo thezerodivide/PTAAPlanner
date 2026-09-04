@@ -11,9 +11,14 @@
 // v2.6 - Sic    01-04-2020 - Updated Bonus to reflect AutoGrant as of 12/19/2019 gives autogrant up to and including TBM, xpac #22
 
 #include <mq/Plugin.h>
+#include <cstdarg>
+#include <cstdio>
+#include <ctime>
 
 PreSetup("MQ2AASpend");
 PLUGIN_VERSION(2.6);
+
+constexpr const char* PTAA_COMPAT_VERSION = "0.1.3";
 
 // The Alternate Ability length converted to decimal is length 10 for a total of 20ish chars, add some padding in case that changes.
 constexpr int MAX_BUYLINE = 32;
@@ -45,6 +50,7 @@ int iBankPoints = 0;
 int doBruteForce = 0;
 int doBruteForceBonusFirst = 0;
 bool doAutoSpend = false;
+int iLastAAPoints = -1;
 
 const std::vector<int> DefaultSpendOrder = { 3, 5, 2, 1, 4 }; // default order is: class, focus, arch, gen, special
 const std::string DefaultSpendOrderString = "35214";
@@ -53,6 +59,183 @@ std::vector<int> SpendOrder = DefaultSpendOrder;
 std::string SpendOrderString = DefaultSpendOrderString;
 
 static void UpdateSpendOrder();
+
+static void RefreshINI();
+static void WriteAACostCache();
+static std::string GetDebugLogPath()
+{
+	char path[MAX_PATH] = { 0 };
+	const char* server = GetServerShortName();
+	const char* character = (pLocalPC && pLocalPC->Name[0]) ? pLocalPC->Name : "Unknown";
+	sprintf_s(path, "%s\\MQ2AASpend_%s_%s_debug.log", gPathConfig,
+		(server && server[0]) ? server : "Unknown", character);
+	return path;
+}
+
+static std::string StripMQColorCodes(const char* text)
+{
+	std::string clean;
+	if (!text) return clean;
+
+	for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p; ++p)
+	{
+		// MacroQuest chat colors are encoded as BEL ('\a') followed by a
+		// one-character color/control code, e.g. "\ag", "\ar", "\ax".
+		if (*p == '\a')
+		{
+			if (*(p + 1))
+				++p;
+			continue;
+		}
+
+		clean.push_back(static_cast<char>(*p));
+	}
+
+	return clean;
+}
+
+static void DebugLogf(const char* format, ...)
+{
+	if (!bDebug) return;
+
+	char buffer[MAX_STRING] = { 0 };
+	va_list args;
+	va_start(args, format);
+	vsnprintf_s(buffer, _countof(buffer), _TRUNCATE, format, args);
+	va_end(args);
+
+	// Keep MacroQuest color codes in the in-game chat output.
+	WriteChatf("%s", buffer);
+
+	// Strip them from the plain-text logfile.
+	const std::string cleanBuffer = StripMQColorCodes(buffer);
+	const std::string path = GetDebugLogPath();
+	FILE* file = nullptr;
+	if (fopen_s(&file, path.c_str(), "a") == 0 && file)
+	{
+		std::time_t now = std::time(nullptr);
+		std::tm localTime = {};
+		localtime_s(&localTime, &now);
+
+		char timestamp[32] = { 0 };
+		std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &localTime);
+		fprintf(file, "[%s] %s\n", timestamp, cleanBuffer.c_str());
+		fclose(file);
+	}
+}
+
+static void ClearDebugLog()
+{
+	const std::string path = GetDebugLogPath();
+	FILE* file = nullptr;
+	if (fopen_s(&file, path.c_str(), "w") == 0 && file)
+		fclose(file);
+}
+
+
+static std::string GetAACostCachePath()
+{
+	char path[MAX_PATH] = { 0 };
+	const char* server = GetServerShortName();
+	const char* character = (pLocalPC && pLocalPC->Name[0]) ? pLocalPC->Name : "Unknown";
+	sprintf_s(path, "%s\\MQ2AASpend_%s_%s_costs.txt", gPathConfig,
+		(server && server[0]) ? server : "Unknown", character);
+	return path;
+}
+
+static void WriteAACostCache()
+{
+	if (!pLocalPlayer || !pLocalPC)
+		return;
+
+	/*
+	 * Build the cache by walking the rank chain for each AA in the current
+	 * priority list instead of iterating 0..NUM_ALT_ABILITIES.
+	 *
+	 * AA IDs on RoF2/Triune are sparse and can be much larger than
+	 * NUM_ALT_ABILITIES, so NUM_ALT_ABILITIES is not a safe upper bound for
+	 * enumerating AA IDs.
+	 *
+	 * MAX_PC_LEVEL is intentionally used for cache lookups so later ranks in
+	 * an AA line can be discovered for full target/"M" cost calculations even
+	 * when the character is below a later rank's normal level requirement.
+	 */
+	std::map<std::string, std::map<int, int>> costsByName;
+
+	for (const AAInfo& info : vAAList)
+	{
+		const std::string& name = info.name;
+
+		int index = GetAAIndexByName((PCHAR)name.c_str());
+		if (index <= 0)
+			continue;
+
+		CAltAbilityData* pRank = GetAAById(index, MAX_PC_LEVEL);
+		if (!pRank)
+			continue;
+
+		std::set<int> seenIds;
+
+		for (int depth = 0; pRank && depth < 100; ++depth)
+		{
+			if (pRank->CurrentRank > 0)
+				costsByName[name][pRank->CurrentRank] = pRank->Cost;
+
+			int currentId = pRank->Index;
+			if (currentId > 0)
+			{
+				if (seenIds.count(currentId))
+					break;
+
+				seenIds.insert(currentId);
+			}
+
+			int nextId = pRank->NextGroupAbilityId;
+			if (nextId <= 0 || seenIds.count(nextId))
+				break;
+
+			CAltAbilityData* pNext = GetAAById(nextId, MAX_PC_LEVEL);
+			if (!pNext || pNext == pRank)
+				break;
+
+			pRank = pNext;
+		}
+	}
+
+	const std::string path = GetAACostCachePath();
+	FILE* file = nullptr;
+	if (fopen_s(&file, path.c_str(), "w") != 0 || !file)
+	{
+		WriteChatf("MQ2AASpend :: Unable to write AA cost cache: %s", path.c_str());
+		return;
+	}
+
+	fprintf(file, "# MQ2AASpend Project Triune AA cost cache v2\n");
+	fprintf(file, "# Format: AA Name|rank=cost;rank=cost;...\n");
+
+	for (const auto& [name, rankCosts] : costsByName)
+	{
+		fprintf(file, "%s|", name.c_str());
+
+		bool first = true;
+		for (const auto& [rank, cost] : rankCosts)
+		{
+			if (!first)
+				fputc(';', file);
+
+			fprintf(file, "%d=%d", rank, cost);
+			first = false;
+		}
+
+		fputc('\n', file);
+	}
+
+	fclose(file);
+
+	if (bDebug)
+		DebugLogf("MQ2AASpend :: Wrote AA cost cache v2 with %d priority abilities: %s",
+			static_cast<int>(costsByName.size()), path.c_str());
+}
 
 //----------------------------------------------------------------------------
 // Merc AA Settings
@@ -88,11 +271,13 @@ static const MercenaryAbilitiesData* FindMercAbilityByName(std::string_view abil
 
 void ShowHelp()
 {
-	WriteChatf("\atMQ2AASpend :: v%1.2f :: by Sym\ax", MQ2Version);
+	WriteChatf("\atMQ2AASpend :: v%s :: by Sym - Project Triune compatibility build by TheZeroDivide\ax", PTAA_COMPAT_VERSION);
 	WriteChatf("/aaspend :: Lists command syntax");
 	if (bInitDone)
 	{
 		WriteChatf("/aaspend status :: Shows current status");
+		WriteChatf("/aaspend costcache :: Rebuilds the Project Triune AA rank-cost cache for PTAAPlanner.");
+		WriteChatf("/aaspend debug on|off|clear|path :: Debug chat + per-character logfile controls.");
 		WriteChatf("/aaspend add \"AA Name\" maxlevel :: Adds AA Name to ini file, will not purchase past max level. Use M to specify max level");
 		WriteChatf("/aaspend del \"AA Name\" :: Deletes AA Name from ini file");
 		WriteChatf("/aaspend buy \"AA Name\" :: Buys a particular AA. Ignores bank setting.");
@@ -117,6 +302,7 @@ void ShowHelp()
 
 void ShowStatus()
 {
+	if (pLocalPC) RefreshINI();
 	WriteChatf("\atMQ2AASpend :: Status\ax");
 	WriteChatf("Brute Force Mode: %s", bBruteForce ? "\agon\ax" : "\aroff\ax");
 	WriteChatf("Brute Force Bonus AA First: %s", bBruteForceBonusFirst ? "\agon\ax" : "\aroff\ax");
@@ -125,6 +311,7 @@ void ShowStatus()
 	UpdateSpendOrder();
 	WriteChatf("Spend Order: \ag%s\ax", SpendOrderString.c_str());
 	WriteChatf("INI has \ay%d\ax abilities listed", vAAList.size());
+	if (bDebug) WriteChatf("Debug logfile: %s", GetDebugLogPath().c_str());
 
 #if HAS_MERCENARY_AA
 	WriteChatf("\atMQ2AASpend :: Merc Status\ax");
@@ -335,11 +522,10 @@ static std::vector<AAInfo> LoadAAInfo(const std::string& section)
 	return aaInfo;
 }
 
-void LoadINI()
+static void RefreshINI()
 {
 	Update_INIFileName();
 
-	// get settings
 	std::string sectionName = "MQ2AASpend_Settings";
 	bAutoSpend = GetPrivateProfileBool(sectionName, "AutoSpend", true, INIFileName);
 	bBruteForce = GetPrivateProfileBool(sectionName, "BruteForce", false, INIFileName);
@@ -357,17 +543,42 @@ void LoadINI()
 	UpdateMercSpendOrder();
 	vMercAAList = LoadAAInfo("MQ2AASpend_MercAAList");
 #endif // HAS_MERCENARY_AA
+}
 
-	// flag first load init as done
+void LoadINI()
+{
+	RefreshINI();
+
+	// Preserve upstream initialization behavior on explicit/startup loads.
 	SaveINI();
 	bInitDone = true;
+
+	WriteAACostCache();
+
+	if (bDebug)
+		DebugLogf("MQ2AASpend :: INI refreshed: %d prioritized abilities, bank=%d",
+			static_cast<int>(vAAList.size()), iBankPoints);
 }
 
 void SpendAAFromINI()
 {
 	if (!pLocalPlayer) return;
-	if (!bAutoSpendNow && GetPcProfile()->AAPoints < iBankPoints) return;
-	if (vAAList.empty()) return;
+
+	// PTAAPlanner may rewrite the INI while the plugin is loaded. Always read
+	// the current list/settings before an automatic purchase pass.
+	RefreshINI();
+
+	if (!bAutoSpendNow && GetPcProfile()->AAPoints < iBankPoints)
+	{
+		DebugLogf("MQ2AASpend :: Waiting for bank threshold: Have=%d Need=%d",
+			GetPcProfile()->AAPoints, iBankPoints);
+		return;
+	}
+	if (vAAList.empty())
+	{
+		DebugLogf("MQ2AASpend :: Priority list is empty after INI refresh.");
+		return;
+	}
 
 	int level = pLocalPlayer->Level;
 
@@ -376,16 +587,14 @@ void SpendAAFromINI()
 		const std::string& vRef = info.name;
 		const std::string& vLevelRef = info.level;
 
-		if (bDebug)
-			WriteChatf("MQ2AASpend :: Have %s from ini, checking...", vRef.c_str());
+		DebugLogf("MQ2AASpend :: Have %s from ini, checking...", vRef.c_str());
 
 		int index = GetAAIndexByName((PCHAR)vRef.c_str());
 		CAltAbilityData* pAbility = GetAAById(index, level);
 
 		if (!pAbility)
 		{
-			if (bDebug)
-				WriteChatf("MQ2AASpend :: %s could not be found.", vRef.c_str());
+			DebugLogf("MQ2AASpend :: %s could not be found.", vRef.c_str());
 
 			continue;
 		}
@@ -408,9 +617,7 @@ void SpendAAFromINI()
 		{
 			bool canTrain = pAltAdvManager->CanTrainAbility(pLocalPC, pRank);
 
-			if (bDebug)
-			{
-				WriteChatf(
+			DebugLogf(
 					"MQ2AASpend :: DEBUG %s rank-chain: Index=%d GroupID=%d Rank=%d MaxRank=%d Cost=%d Type=%d NextGroupAbilityId=%d CanTrain=%s",
 					vRef.c_str(),
 					pRank->Index,
@@ -421,7 +628,6 @@ void SpendAAFromINI()
 					pRank->Type,
 					pRank->NextGroupAbilityId,
 					canTrain ? "TRUE" : "FALSE");
-			}
 
 			if (canTrain)
 			{
@@ -442,8 +648,7 @@ void SpendAAFromINI()
 
 		if (!pCandidate)
 		{
-			if (bDebug)
-				WriteChatf("MQ2AASpend :: %s is \arNOT available\ax for purchase.", vRef.c_str());
+			DebugLogf("MQ2AASpend :: %s is \arNOT available\ax for purchase.", vRef.c_str());
 
 			continue;
 		}
@@ -452,8 +657,7 @@ void SpendAAFromINI()
 
 		if (!pAbility->Type)
 		{
-			if (bDebug)
-				WriteChatf("MQ2AASpend :: %s is \arNOT available\ax for purchase.", vRef.c_str());
+			DebugLogf("MQ2AASpend :: %s is \arNOT available\ax for purchase.", vRef.c_str());
 
 			continue;
 		}
@@ -465,16 +669,13 @@ void SpendAAFromINI()
 		// pAbility is now the first trainable rank in the chain.
 		int ownedLevel = purchaseLevel > 0 ? purchaseLevel - 1 : 0;
 
-		if (bDebug)
-		{
-			WriteChatf(
-				"MQ2AASpend :: %s is \agavailable\ax for purchase. Cost is %d, tab is %d",
-				vRef.c_str(), aaCost, aaType);
+		DebugLogf(
+			"MQ2AASpend :: %s is \agavailable\ax for purchase. Cost is %d, tab is %d",
+			vRef.c_str(), aaCost, aaType);
 
-			WriteChatf(
-				"MQ2AASpend :: %s current level is %d; next purchase is level %d",
-				vRef.c_str(), ownedLevel, purchaseLevel);
-		}
+		DebugLogf(
+			"MQ2AASpend :: %s current level is %d; next purchase is level %d",
+			vRef.c_str(), ownedLevel, purchaseLevel);
 
 		// Respect a numeric maximum rank from the INI.
 		// "M" means purchase every available rank.
@@ -484,8 +685,7 @@ void SpendAAFromINI()
 
 			if (ownedLevel >= configuredMax)
 			{
-				if (bDebug)
-				WriteChatf("MQ2AASpend :: %s max level has been reached per ini setting, skipping",
+				DebugLogf("MQ2AASpend :: %s max level has been reached per ini setting, skipping",
 					vRef.c_str());
 
 				continue;
@@ -494,16 +694,22 @@ void SpendAAFromINI()
 
 		if (GetPcProfile()->AAPoints < aaCost)
 		{
-			WriteChatf("MQ2AASpend :: Not enough points to buy %s, skipping", vRef.c_str());
+			if (bDebug)
+				DebugLogf("MQ2AASpend :: Not enough points to buy %s: Have=%d Need=%d",
+					vRef.c_str(), GetPcProfile()->AAPoints, aaCost);
+			else
+				WriteChatf("MQ2AASpend :: Not enough points to buy %s, skipping", vRef.c_str());
 			continue;
 		}
 
-		WriteChatf(
-			"MQ2AASpend :: Attempting to purchase level %d of %s for %d point%s.",
-			purchaseLevel,
-			vRef.c_str(),
-			aaCost,
-			aaCost > 1 ? "s" : "");
+		if (bDebug)
+			DebugLogf(
+				"MQ2AASpend :: Attempting to purchase level %d of %s for %d point%s.",
+				purchaseLevel, vRef.c_str(), aaCost, aaCost > 1 ? "s" : "");
+		else
+			WriteChatf(
+				"MQ2AASpend :: Attempting to purchase level %d of %s for %d point%s.",
+				purchaseLevel, vRef.c_str(), aaCost, aaCost > 1 ? "s" : "");
 
 		if (!bDebug)
 		{
@@ -519,7 +725,7 @@ void SpendAAFromINI()
 		}
 		else
 		{
-			WriteChatf("MQ2AASpend :: Debugging so I wont actually buy %s", vRef.c_str());
+			DebugLogf("MQ2AASpend :: Debugging so I wont actually buy %s", vRef.c_str());
 		}
 
 		// Purchase one AA per pass, preserving original behavior.
@@ -955,10 +1161,12 @@ PLUGIN_API void SetGameState(int GameState)
 	if (GameState == GAMESTATE_INGAME)
 	{
 		if (!bInitDone) LoadINI();
+		iLastAAPoints = GetPcProfile()->AAPoints;
 	}
 	else if (GameState != GAMESTATE_LOGGINGIN)
 	{
 		if (bInitDone) bInitDone = false;
+		iLastAAPoints = -1;
 	}
 }
 
@@ -1031,13 +1239,37 @@ void SpendCommand(PSPAWNINFO pChar, PCHAR szLine)
 		if (!_strcmpi(szArg2, "on"))
 		{
 			bDebug = true;
+			DebugLogf("MQ2AASpend :: Debug enabled.");
+			WriteChatf("MQ2AASpend :: Debug logfile: %s", GetDebugLogPath().c_str());
 		}
 		else if (!_strcmpi(szArg2, "off"))
 		{
+			if (bDebug)
+				DebugLogf("MQ2AASpend :: Debug disabled.");
 			bDebug = false;
+		}
+		else if (!_strcmpi(szArg2, "clear"))
+		{
+			ClearDebugLog();
+			WriteChatf("MQ2AASpend :: Debug logfile cleared: %s", GetDebugLogPath().c_str());
+		}
+		else if (!_strcmpi(szArg2, "path"))
+		{
+			WriteChatf("MQ2AASpend :: Debug logfile: %s", GetDebugLogPath().c_str());
+		}
+		else
+		{
+			WriteChatf("Usage: /aaspend debug on|off|clear|path");
 		}
 
 		WriteChatf("MQ2AASpend :: Debug is %s", bDebug ? "\agON\ax" : "\arOFF\ax");
+		return;
+	}
+
+	if (!_strcmpi(szArg1, "costcache"))
+	{
+		WriteAACostCache();
+		WriteChatf("MQ2AASpend :: AA cost cache refreshed: %s", GetAACostCachePath().c_str());
 		return;
 	}
 
@@ -1133,6 +1365,7 @@ void SpendCommand(PSPAWNINFO pChar, PCHAR szLine)
 			bBruteForce = false;
 			bBruteForceBonusFirst = false;
 			bAutoSpendNow = false;
+			SaveINI();
 		}
 		else if (!_strcmpi(szArg2, "off"))
 		{
@@ -1140,10 +1373,12 @@ void SpendCommand(PSPAWNINFO pChar, PCHAR szLine)
 
 			bAutoSpend = false;
 			bAutoSpendNow = false;
+			SaveINI();
 		}
 		else if (!_strcmpi(szArg2, "now"))
 		{
 			WriteChatf("MQ2AASpend :: Auto Mode Active Now");
+			RefreshINI();
 
 			if (!vAAList.empty())
 			{
@@ -1168,6 +1403,13 @@ void SpendCommand(PSPAWNINFO pChar, PCHAR szLine)
 			WriteChatf("MQ2AASpend :: Banking %d points", iBankPoints);
 
 			SaveINI();
+
+			if (bAutoSpend && pLocalPC && GetPcProfile()->AAPoints >= iBankPoints)
+			{
+				doAutoSpend = true;
+				DebugLogf("MQ2AASpend :: Bank threshold already met after update: Have=%d Need=%d. Scheduling purchase pass.",
+					GetPcProfile()->AAPoints, iBankPoints);
+			}
 		}
 
 		return;
@@ -1389,6 +1631,25 @@ PLUGIN_API void OnPulse()
 
 	Pulse = 0;
 
+	// Do not rely solely on chat text to detect AA gains. Emulator servers can
+	// format AA gain messages differently. Detect an increase in the character's
+	// AA point total and schedule Auto Spend whenever the bank threshold is met.
+	int currentAAPoints = GetPcProfile()->AAPoints;
+	if (iLastAAPoints < 0)
+	{
+		iLastAAPoints = currentAAPoints;
+	}
+	else
+	{
+		if (currentAAPoints > iLastAAPoints && bAutoSpend && currentAAPoints >= iBankPoints)
+		{
+			doAutoSpend = true;
+			DebugLogf("MQ2AASpend :: AA points increased from %d to %d and bank threshold %d is met. Scheduling purchase pass.",
+				iLastAAPoints, currentAAPoints, iBankPoints);
+		}
+		iLastAAPoints = currentAAPoints;
+	}
+
 	//----------------------------------------------------------------------------
 	// AA Actions
 
@@ -1404,7 +1665,7 @@ PLUGIN_API void OnPulse()
 		doBruteForceBonusFirst = 0;
 	}
 
-	if (doAutoSpend && !vAAList.empty())
+	if (doAutoSpend)
 	{
 		SpendAAFromINI();
 		doAutoSpend = false;
@@ -1437,7 +1698,7 @@ PLUGIN_API bool OnIncomingChat(const char* Line, DWORD Color)
 			doBruteForce = 1;
 		if (bBruteForceBonusFirst)
 			doBruteForceBonusFirst = 1;
-		if (bAutoSpend && !vAAList.empty())
+		if (bAutoSpend)
 			doAutoSpend = true;
 
 #if HAS_MERCENARY_AA
@@ -1458,7 +1719,7 @@ PLUGIN_API bool OnIncomingChat(const char* Line, DWORD Color)
 		if (bBruteForceMerc)
 			doBruteForceMerc = 1;
 #endif // HAS_MERCENARY_AA
-		if (bAutoSpend && !vAAList.empty())
+		if (bAutoSpend)
 			doAutoSpend = true;
 	}
 
