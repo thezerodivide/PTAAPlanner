@@ -1,72 +1,45 @@
 # PTAAPlanner
 
-PTAAPlanner is a Project Triune AA planning tool for MacroQuest.
+PTAAPlanner is a Project Triune Alternate Advancement planning and automatic purchasing tool for MacroQuest.
 
-It provides a graphical interface for building a prioritized Alternate Advancement purchase list and uses the Project Triune-compatible MQ2AASpend plugin to perform the actual purchases.
+It provides a graphical interface for building prioritized AA purchase lists and includes a native Lua AA spender. No MQ2AASpend plugin is required.
 
 ## Features
 
 PTAAPlanner includes:
 
-- Graphical AA browsing and selection
-- General, Archetype, and Class AA categories
-- Custom purchase priorities
-- Target-rank selection
-- Automatic removal of completed priorities
-- Dynamic AA banking
-- Live unspent AA point display
-- Priority-list AA cost estimates
-- Next purchase and next-rank cost display
-- Compact and full UI modes
-- Saved AA lists
-- Import/export support
-- Diagnostic logging
-- Integration with PTMQ2AASpend
+* Graphical AA browsing and selection
+* General, Archetype, and Class AA categories
+* Automatic Project Triune class detection
+* Manual class selection fallback
+* Custom purchase priorities
+* Target-rank selection
+* Automatic removal of completed priorities
+* Native Lua AA purchasing
+* Automatic AA spending
+* Manual **Spend Next Now**
+* Queued manual purchases when a safety condition is active
+* Configurable purchase safety checks
+* Fast AA Purchase support
+* Live unspent AA point display
+* Priority-list AA cost estimates
+* Next purchase, next rank, and cost display
+* Optional Consume Experience support
+* Configurable Consume Experience AA threshold
+* Compact and full UI modes
+* Saved AA lists
+* Import/export support
+* Diagnostic logging
 
 ## Requirements
 
-- Project Triune
-- Latest MacroQuest RoF2 build
-- PTAAPlanner
-- PTMQ2AASpend
+* Project Triune
+* MacroQuest compatible with Project Triune
+* PTAAPlanner
 
-### PTMQ2AASpend
-
-PTAAPlanner requires the Project Triune compatibility build of MQ2AASpend:
-
-**ProjectTriuneMQ2AASpend**
-
-https://github.com/thezerodivide/ProjectTriuneMQ2AASpend
-
-Download the latest compiled plugin here:
-
-https://github.com/thezerodivide/ProjectTriuneMQ2AASpend/releases
-
-PTAAPlanner and PTMQ2AASpend are versioned independently.
-
-A new PTAAPlanner release does **not** necessarily require a new MQ2AASpend DLL.
+PTAAPlanner v0.2 and later do **not** require MQ2AASpend or PTMQ2AASpend.
 
 ## Installation
-
-### 1. Install PTMQ2AASpend
-
-Download the latest `MQ2AASpend.dll` from:
-
-https://github.com/thezerodivide/ProjectTriuneMQ2AASpend/releases
-
-Copy it to:
-
-```text
-MacroQuest\plugins\
-```
-
-Load the plugin in-game with:
-
-```text
-/plugin mq2aaspend load
-```
-
-### 2. Install PTAAPlanner
 
 Download `aaplanner.lua` from the latest PTAAPlanner release and copy it to:
 
@@ -80,142 +53,264 @@ Start PTAAPlanner with:
 /lua run aaplanner
 ```
 
+The planner will create its configuration and saved-list data automatically in the MacroQuest config directory.
+
 ## Basic Usage
 
-Open PTAAPlanner:
+Start PTAAPlanner:
 
 ```text
 /lua run aaplanner
 ```
 
-Select the classes used by your Project Triune character and click:
+PTAAPlanner will attempt to detect the three classes used by the currently logged-in Project Triune character.
+
+If detection is incorrect or unavailable, select the classes manually or click:
 
 ```text
 Re-detect
 ```
 
-PTAAPlanner will build the available AA catalog for the selected classes.
+Refresh the AA catalog if necessary.
 
-Add AAs to the Purchase Priority list and arrange them in the order you want them purchased.
+Add AAs to the **Purchase Priority** list and arrange them in the order you want them purchased.
 
-You can choose:
+For each AA, you can set:
 
-- `M` to purchase the AA through the maximum available rank
-- A specific rank number to stop at that rank
+* `M` to continue purchasing through the maximum available rank
+* A specific rank number to stop at that rank
 
-When the list is ready:
+When your priority list is ready, click:
 
-1. Click **Write MQ2AASpend List**
-2. Click **Enable Auto Spend**
+```text
+Enable Auto Spend
+```
 
-PTAAPlanner will write the priority list into the character's MQ2AASpend configuration and enable automatic purchasing.
+PTAAPlanner will purchase eligible AAs directly through the in-game Alternate Advancement window in the displayed priority order.
+
+No external AA spending plugin is required.
 
 ## Purchase Priority
 
-The Purchase Priority panel shows the order in which PTAAPlanner wants AAs purchased.
+The Purchase Priority panel determines the order in which PTAAPlanner attempts to purchase AAs.
 
-PTAAPlanner automatically removes an entry when:
+PTAAPlanner always works from the highest incomplete priority downward.
 
-- The selected target rank has been reached
-- An AA set to `M` has been fully trained
+An entry is automatically removed when:
 
-When the top priority changes, PTAAPlanner rewrites the MQ2AASpend list and recalculates the Dynamic Bank automatically.
+* Its selected target rank has been reached
+* An AA set to `M` has reached its maximum available rank
 
-## Dynamic Banking
+The next incomplete entry then becomes the active priority.
 
-PTAAPlanner dynamically controls MQ2AASpend's AA bank value based on the next planned purchase.
+The panel also displays:
 
-For example:
+* Current unspent AA points
+* Known priority-list AA cost
+* Additional AA points needed
+* Next AA to be purchased
+* Current rank
+* Next rank
+* Target rank
+* Next-rank cost
+* Native Auto Spend status
 
-```text
-Gift of Mana
-Next Rank Cost: 9 AA
-```
+### Future Rank Costs
 
-PTAAPlanner sets:
+Project Triune's RoF2 AA data does not always expose the cost of ranks that are not yet immediately trainable.
 
-```text
-/aaspend bank 9
-```
-
-This prevents MQ2AASpend from spending points on a lower-cost AA simply because the highest-priority purchase is not yet affordable.
-
-The Purchase Priority summary displays:
-
-```text
-Dynamic Bank: 9
-Next Purchase: Gift of Mana
-Cost: 9 AA
-```
-
-This makes it easy to confirm that the bank matches the expected next purchase.
-
-## AA Requirements and Prerequisites
-
-MQ2AASpend only purchases AA ranks that are currently trainable.
-
-If an AA near the top of the priority list does not yet meet its requirements, MQ2AASpend may skip it and purchase the next eligible priority.
-
-Once the prerequisite becomes available, the AA can become eligible on a later purchase pass.
-
-This is expected behavior.
-
-## Multi-Rank AA Handling
-
-Project Triune's RoF2 AA data behaves differently from standard modern EverQuest AA data.
-
-For example, an untrained ability may appear in-game as:
-
-```text
-0/1
-```
-
-while the underlying MacroQuest AA record reports:
-
-```text
-CurrentRank = 1
-MaxRank = 1
-```
-
-The Project Triune-compatible MQ2AASpend build includes changes specifically designed to handle these AA records correctly.
-
-It also walks linked AA rank data to improve handling of partially trained multi-rank abilities.
-
-## Priority List Cost
-
-PTAAPlanner calculates the known remaining cost of the Purchase Priority list.
-
-Example:
+When PTAAPlanner can resolve the entire remaining list, it may display:
 
 ```text
 Priority List Cost: 42 AA
 Additional AA Needed: 25
 ```
 
-Project Triune's RoF2 AA data does not always expose every future rank cost.
-
-When some future costs cannot be resolved reliably, PTAAPlanner reports:
+When future rank costs are not yet available, PTAAPlanner reports only the cost it can verify:
 
 ```text
-Priority List Cost: at least 81 AA
+Priority List Cost: at least 18 AA
 (some future rank costs unresolved)
 ```
 
-rather than guessing.
+PTAAPlanner does not guess unknown future rank costs.
+
+## Native Lua Auto Spend
+
+Beginning with v0.2, AA purchasing is handled directly by PTAAPlanner.
+
+The previous MQ2AASpend handoff is no longer used.
+
+To enable automatic spending, click:
+
+```text
+Enable Auto Spend
+```
+
+When enough AA points are available, PTAAPlanner:
+
+1. Finds the highest-priority incomplete AA
+2. Verifies that its next rank is trainable
+3. Opens the in-game Alternate Advancement window if necessary
+4. Selects the correct AA category
+5. Locates the intended AA
+6. Selects and verifies the exact AA row
+7. Activates the Train button
+8. Handles the purchase confirmation if one appears
+9. Verifies the purchase by checking the AA rank and AA point total
+10. Removes completed priorities and continues to the next entry
+
+If PTAAPlanner cannot safely verify what it is about to purchase, it stops Auto Spend instead of attempting an uncertain purchase.
+
+## Fast AA Purchase
+
+PTAAPlanner supports EverQuest's **Fast AA Purchase** option.
+
+When Fast AA Purchase is enabled, EverQuest may complete the purchase immediately without displaying a confirmation window.
+
+PTAAPlanner detects the resulting AA rank or AA point change and treats the purchase as successful without waiting for a confirmation dialog.
+
+Normal confirmation-dialog purchasing is also supported.
+
+## Purchase Verification and Safety
+
+PTAAPlanner includes several protections intended to prevent the wrong AA from being purchased.
+
+Before training an AA, PTAAPlanner verifies the selected AA row and reasserts the intended selection immediately before clicking Train.
+
+If a confirmation dialog appears, PTAAPlanner checks that its text corresponds to the planned AA before clicking **Yes**.
+
+PTAAPlanner will not blindly confirm an unrelated dialog.
+
+Auto Spend is stopped when conditions such as the following occur:
+
+* The intended AA cannot be found
+* The selected AA row changes unexpectedly
+* The selected row cannot be safely verified
+* An unrelated confirmation dialog is already open
+* The confirmation dialog does not match the planned AA
+* AA prerequisites or level requirements are not met
+* A purchase cannot be verified after it is attempted
+
+This behavior favors stopping safely over risking an unintended AA purchase.
+
+## Auto Spend Safety Checks
+
+PTAAPlanner includes individually configurable pre-purchase safety checks.
+
+Open:
+
+```text
+Auto Spend Safety Checks
+```
+
+to configure them.
+
+Available checks include:
+
+* **Casting**
+* **Moving**
+* **Navigating**
+* **In Combat**
+* **Using AutoFire**
+* **Live XTargets / Aggro**
+
+When an enabled condition is active, PTAAPlanner temporarily delays the purchase.
+
+These checks are configurable because Project Triune characters are often actively pulling, navigating, fighting, or maintaining XTargets while AA points are earned.
+
+The default settings are intended to avoid conditions that are most likely to interfere with the UI purchase process while allowing normal automated hunting behavior.
+
+If a particular check is unnecessary for your setup, it can be disabled.
+
+Safety-check settings are saved between sessions.
+
+## Spend Next Now
+
+Use:
+
+```text
+Spend Next Now
+```
+
+to manually request the next priority purchase without enabling continuous Auto Spend.
+
+If an enabled safety condition is currently active, the request is queued rather than discarded.
+
+PTAAPlanner will automatically retry the request when the blocking condition clears.
+
+While a manual request is queued, the button changes to:
+
+```text
+Cancel Queued Spend
+```
+
+Use it to cancel the pending request.
+
+## AA Requirements and Prerequisites
+
+Before attempting a purchase, PTAAPlanner checks whether the next rank can currently be trained.
+
+If the highest-priority AA does not meet its prerequisites or level requirements, PTAAPlanner does **not** skip ahead and spend points on another priority.
+
+Instead, Auto Spend is disabled and the blocked AA is reported.
+
+This preserves the exact purchase priority selected by the user.
+
+After resolving the prerequisite or level requirement, re-enable Auto Spend.
+
+## Consume Experience
+
+PTAAPlanner can optionally use Project Triune's **Consume Experience** ability after the AA priority list is complete.
+
+Enable:
+
+```text
+Use Consume Experience after priority list
+```
+
+Then configure:
+
+```text
+Consume trigger
+```
+
+The trigger specifies the number of unspent AA points required before PTAAPlanner attempts to activate Consume Experience.
+
+For example:
+
+```text
+Consume trigger: 100
+```
+
+means Consume Experience will only be activated after:
+
+* The Purchase Priority list is empty or complete
+* At least 100 unspent AA points are available
+
+PTAAPlanner verifies that the AA point total changes after activating Consume Experience.
+
+If activation cannot be confirmed, PTAAPlanner reports the failure rather than repeatedly activating the ability.
+
+The Consume Experience setting and threshold are saved between sessions.
 
 ## Compact Mode
 
-PTAAPlanner includes a Compact Mode for users who want to keep the planner visible while playing without occupying a large portion of the screen.
+PTAAPlanner includes a Compact Mode for keeping essential AA information visible while playing without occupying a large portion of the screen.
 
 Compact Mode displays:
 
-- Unspent AA points
-- Dynamic Bank
-- Next Purchase
-- Current and next rank
-- Next-rank cost
-- Remaining priority count
-- Bank mismatch warning
+* Unspent AA points
+* Native Auto Spend status
+* Next purchase
+* Current rank
+* Next rank
+* Target rank
+* Next-rank cost
+* Consume Experience status
+* Remaining priority count
+
+Compact Mode also includes controls to enable or disable Auto Spend.
 
 Switch to Compact Mode with:
 
@@ -235,51 +330,62 @@ The selected mode is remembered between sessions.
 
 ## Saved Lists
 
-PTAAPlanner allows you to save reusable AA plans.
+PTAAPlanner allows reusable AA plans to be saved locally.
 
 Use the saved-list controls to:
 
-- Save the current list
-- Load a saved list
-- Delete a saved list
+* Save the current priority list
+* Load a saved list
+* Delete a saved list
 
-This makes it easy to maintain different AA plans for different characters, builds, or progression stages.
+This makes it easy to maintain separate AA plans for different characters, class combinations, or progression stages.
 
 ## Import / Export
 
-PTAAPlanner supports importing and exporting planner data.
+PTAAPlanner supports importing and exporting priority lists.
 
 This can be used to:
 
-- Back up AA plans
-- Share plans with other players
-- Move a plan between characters or installations
+* Back up AA plans
+* Share AA plans with other players
+* Move plans between characters
+* Move plans between MacroQuest installations
 
-## PTMQ2AASpend Integration
+Use:
 
-PTAAPlanner uses PTMQ2AASpend for actual AA purchasing.
+```text
+Copy Planner Format
+```
 
-The compatibility plugin adds Project Triune-specific behavior including:
+to copy the current list to the clipboard.
 
-- Improved rank handling
-- Multi-rank AA traversal
-- Dynamic bank support
-- AA point monitoring
-- Live INI refresh
-- Debug logging
-- AA cost-cache generation
+PTAAPlanner's native export format begins with:
 
-PTMQ2AASpend repository:
+```text
+AAPLANNER1
+```
 
-https://github.com/thezerodivide/ProjectTriuneMQ2AASpend
+The import window also accepts supported legacy `Name|Rank` list entries.
 
-Latest PTMQ2AASpend releases:
+Importing a list replaces the current working priority list.
 
-https://github.com/thezerodivide/ProjectTriuneMQ2AASpend/releases
+## Automatic Saving
+
+PTAAPlanner automatically saves its working configuration when changes are made.
+
+Saved data includes:
+
+* Current working priority list
+* Named saved lists
+* Selected class combination
+* Compact Mode preference
+* Consume Experience setting
+* Consume Experience threshold
+* Auto Spend safety-check settings
+
+This helps protect the current configuration if EverQuest or MacroQuest closes unexpectedly.
 
 ## Debugging
-
-### PTAAPlanner Debug Snapshot
 
 Run:
 
@@ -287,42 +393,46 @@ Run:
 /aaplanner debug
 ```
 
-PTAAPlanner writes a diagnostic snapshot containing information such as:
+PTAAPlanner prints diagnostic information and writes a detailed priority snapshot to its debug log.
 
-- PTAAPlanner version
-- Current AA points
-- Purchase priorities
-- Current and target ranks
-- Known remaining costs
-- Dynamic Bank
-- Next-rank costs
+Debug information includes:
 
-### MQ2AASpend Debugging
+* PTAAPlanner version
+* Detected classes
+* AA catalog statistics
+* Current AA points
+* Purchase priorities
+* Current and target ranks
+* Known remaining costs
+* Next-rank costs
+* Native Auto Spend status
+* Pending purchase state
+* Queued manual purchase state
+* Consume Experience settings
+* Auto Spend safety-check settings
 
-PTMQ2AASpend supports:
-
-```text
-/aaspend debug on
-/aaspend debug off
-/aaspend debug clear
-/aaspend debug path
-```
-
-Debug output is written to a per-character log file such as:
+The debug log is character-specific and uses a filename similar to:
 
 ```text
-MQ2AASpend_<Server>_<Character>_debug.log
+PTAAPlanner_<Server>_<Character>_debug.log
 ```
 
-PTAAPlanner diagnostic snapshots are written to the same log when possible.
+Purchase activity and important Auto Spend failures are also logged, including:
+
+* Successful AA purchases
+* Prerequisite or trainability blocks
+* Confirmation mismatches
+* Purchase verification timeouts
+* Consume Experience activation
+
+When reporting an AA purchasing issue, please include this log whenever possible.
 
 ## Useful Commands
-
-### PTAAPlanner
 
 ```text
 /lua run aaplanner
 /lua stop aaplanner
+
 /aaplanner
 /aaplanner show
 /aaplanner compact
@@ -332,74 +442,76 @@ PTAAPlanner diagnostic snapshots are written to the same log when possible.
 /aaplanner quit
 ```
 
-### PTMQ2AASpend
+### `/aaplanner`
 
-```text
-/aaspend
-/aaspend status
-/aaspend load
-/aaspend auto on
-/aaspend auto off
-/aaspend auto now
-/aaspend bank <points>
-/aaspend debug on
-/aaspend debug off
-/aaspend debug clear
-/aaspend debug path
-/aaspend costcache
-```
+Shows the PTAAPlanner window.
+
+### `/aaplanner compact`
+
+Switches directly to Compact Mode.
+
+### `/aaplanner full`
+
+Returns to the full planner interface.
+
+### `/aaplanner refresh`
+
+Refreshes the current character's AA catalog.
+
+### `/aaplanner debug`
+
+Prints diagnostic information and writes a priority snapshot to the PTAAPlanner debug log.
+
+### `/aaplanner quit`
+
+Stops PTAAPlanner.
 
 ## Updating PTAAPlanner
 
-PTAAPlanner releases normally contain only the Lua planner.
+PTAAPlanner is distributed as a Lua script.
 
 To update:
 
 1. Download the latest `aaplanner.lua`
-2. Replace the existing file in:
+2. Replace the existing copy in:
 
 ```text
 MacroQuest\lua\
 ```
 
-3. Restart the Lua:
+3. Restart PTAAPlanner:
 
 ```text
 /lua stop aaplanner
 /lua run aaplanner
 ```
 
-You only need to update `MQ2AASpend.dll` when a new PTMQ2AASpend release is published.
+Your saved lists and configuration are stored separately and are not contained in `aaplanner.lua`.
 
-## Updating PTMQ2AASpend
+## Upgrading from an Earlier Version
 
-Download the latest release from:
+PTAAPlanner v0.2 changes how automatic AA purchasing works.
 
-https://github.com/thezerodivide/ProjectTriuneMQ2AASpend/releases
+Previous versions used a Project Triune-compatible MQ2AASpend plugin to perform purchases.
 
-Unload the existing plugin:
+Beginning with v0.2:
 
-```text
-/plugin mq2aaspend unload
-```
+* AA purchasing is handled directly by `aaplanner.lua`
+* MQ2AASpend is no longer required
+* Dynamic MQ2AASpend banking is no longer used
+* PTAAPlanner follows the displayed priority list directly
+* A blocked top priority stops Auto Spend instead of allowing another priority to be purchased
+* Purchase selection and confirmation are verified by PTAAPlanner itself
 
-Replace:
-
-```text
-MacroQuest\plugins\MQ2AASpend.dll
-```
-
-Then reload it:
-
-```text
-/plugin mq2aaspend load
-```
+Users may leave MQ2AASpend installed for other purposes, but PTAAPlanner does not require or manage it.
 
 ## Related Projects
 
-### PTMQ2AASpend
+### ProjectTriuneMQ2AASpend
 
-Project Triune compatibility build of MQ2AASpend:
+Previous PTAAPlanner releases used the Project Triune compatibility build of MQ2AASpend.
+
+The project remains available here:
 
 https://github.com/thezerodivide/ProjectTriuneMQ2AASpend
 
@@ -421,6 +533,8 @@ https://github.com/macroquest/macroquest/releases
 
 PTAAPlanner by **TheZeroDivide**.
 
+Earlier versions of PTAAPlanner integrated with MQ2AASpend.
+
 MQ2AASpend was originally created by **Sym** and is maintained through the RedGuides MacroQuest community.
 
 Upstream MQ2AASpend:
@@ -437,9 +551,9 @@ PTAAPlanner is an unofficial Project Triune utility.
 
 It is not affiliated with or endorsed by:
 
-- Project Triune
-- MacroQuest
-- RedGuides
-- The original MQ2AASpend author
+* Project Triune
+* MacroQuest
+* RedGuides
+* The original MQ2AASpend author
 
 Use at your own risk.
