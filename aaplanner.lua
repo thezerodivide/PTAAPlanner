@@ -8,8 +8,13 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local APP_NAME = 'Project Triune AA Planner'
-local VERSION = '0.2'
+local VERSION = '0.2.2'
 local open = true
+
+-- Build-time diagnostic policy:
+--   Test/internal builds: set VERBOSE_DEBUG = true so automatic snapshots are captured.
+--   Release candidates/releases: leave this false; /aaplanner debug still forces a full snapshot.
+local VERBOSE_DEBUG = false
 
 local configDir = mq.configDir
 if not configDir or configDir == '' then
@@ -17,34 +22,23 @@ if not configDir or configDir == '' then
 end
 configDir = configDir or '.'
 
-local saveFile = configDir .. '/aaplanner_lists.lua'
+local sharedSaveFile = configDir .. '/aaplanner_lists.lua'
+local sharedLockDir = sharedSaveFile .. '.lock'
+local sharedLockOwnerFile = sharedLockDir .. '/owner.txt'
+local characterSaveFile = nil
 local TAB_NAMES = { [1] = 'General', [2] = 'Archetype', [3] = 'Class' }
 local TAB_IDS = { General = 1, Archetype = 2, Class = 3 }
-local CLASS_ABBR = { 'WAR', 'CLR', 'PAL', 'RNG', 'SHD', 'DRU', 'MNK', 'BRD', 'ROG', 'SHM', 'NEC', 'WIZ', 'MAG', 'ENC', 'BST', 'BER' }
-local CLASS_NAME = {
-    WAR = 'Warrior', CLR = 'Cleric', PAL = 'Paladin', RNG = 'Ranger', SHD = 'Shadowknight',
-    DRU = 'Druid', MNK = 'Monk', BRD = 'Bard', ROG = 'Rogue', SHM = 'Shaman',
-    NEC = 'Necromancer', WIZ = 'Wizard', MAG = 'Magician', ENC = 'Enchanter',
-    BST = 'Beastlord', BER = 'Berserker'
-}
-local CLASS_LOOKUP = {}
-for _, abbr in ipairs(CLASS_ABBR) do
-    CLASS_LOOKUP[abbr] = abbr
-    CLASS_LOOKUP[CLASS_NAME[abbr]:upper():gsub('[%s_%-]', '')] = abbr
-end
-CLASS_LOOKUP.SK = 'SHD'
-CLASS_LOOKUP.SHADOWKNIGHT = 'SHD'
-CLASS_LOOKUP.BEAST = 'BST'
-
 local state = {
-    classes = { 'WAR', 'CLR', 'ROG' },
-    classDetected = false,
     selectedTab = 1,
     search = '',
     hideMaxed = false,
     catalog = {},
     catalogByName = {},
+    catalogGeneration = 0,
+    prerequisiteCache = {},
+    prerequisiteRuntimeStatus = {},
     plan = {},
+    planGeneration = 0,
     savedLists = {},
     saveName = '',
     selectedSaved = '',
@@ -55,13 +49,13 @@ local state = {
     statusKind = 'info',
     statusExpiresAt = nil,
     scanRequested = true,
-    detectRequested = true,
     enableRequested = false,
+    pendingListSave = nil,
+    pendingListDelete = nil,
     dirty = false,
     autoManageActive = false,
     autoSpendEnabled = false,
-    consumeExperience = false,
-    consumeExperienceThreshold = 100,
+    skipUnmetPrerequisites = false,
     aaPoints = 0,
     queueCost = 0,
     queueCostComplete = true,
@@ -70,6 +64,7 @@ local state = {
     compactMode = false,
     windowResizeRequested = false,
     maintenanceAt = 0,
+    sharedListsRefreshAt = 0,
     pendingPurchase = nil,
     manualSpendQueued = false,
     nextSpendAt = 0,
@@ -126,62 +121,400 @@ local function copyPlan(plan)
     return result
 end
 
-local function writeSavedData()
-    local file, err = io.open(saveFile, 'wb')
-    if not file then return false, err end
-    file:write('return {\n')
-    file:write('  classes = {')
-    for i, cls in ipairs(state.classes) do
-        if i > 1 then file:write(', ') end
-        file:write(escapeLuaString(cls))
+local function sanitizeFilePart(value)
+    value = trim(value)
+    if value == '' or value == 'NULL' then return nil end
+    return value:gsub('[^%w_%-]', '_')
+end
+
+local function resolveCharacterSaveFile()
+    if characterSaveFile then return characterSaveFile end
+    local character = sanitizeFilePart(mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or '')
+    local server = ''
+    pcall(function() server = sanitizeFilePart(mq.TLO.MacroQuest.Server() or '') or '' end)
+    if server == '' then
+        pcall(function() server = sanitizeFilePart(mq.parse('${MacroQuest.Server}')) or '' end)
     end
-    file:write('},\n  current = {\n')
-    for _, entry in ipairs(state.plan) do
-        file:write(string.format('    {name=%s, rank=%s, tab=%d},\n',
-            escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0))
+    if not character or server == '' then return nil end
+    characterSaveFile = configDir .. '/PTAAPlanner_' .. server .. '_' .. character .. '.lua'
+    return characterSaveFile
+end
+
+local function copySavedLists(lists)
+    local result = {}
+    for name, list in pairs(lists or {}) do
+        if type(name) == 'string' and type(list) == 'table' then
+            result[name] = copyPlan(list)
+        end
     end
-    file:write('  },\n')
-    file:write(string.format('  compactMode = %s,\n', tostring(state.compactMode == true)))
-    file:write(string.format('  consumeExperience = %s,\n', tostring(state.consumeExperience == true)))
-    file:write(string.format('  consumeExperienceThreshold = %d,\n',
-        math.max(1, math.floor(tonumber(state.consumeExperienceThreshold) or 100))))
-    file:write(string.format('  safetyCheckCasting = %s,\n', tostring(state.safetyCheckCasting == true)))
-    file:write(string.format('  safetyCheckMoving = %s,\n', tostring(state.safetyCheckMoving == true)))
-    file:write(string.format('  safetyCheckNavigating = %s,\n', tostring(state.safetyCheckNavigating == true)))
-    file:write(string.format('  safetyCheckCombat = %s,\n', tostring(state.safetyCheckCombat == true)))
-    file:write(string.format('  safetyCheckAutofire = %s,\n', tostring(state.safetyCheckAutofire == true)))
-    file:write(string.format('  safetyCheckXTargets = %s,\n', tostring(state.safetyCheckXTargets == true)))
-    file:write('  lists = {\n')
+    return result
+end
+
+local function buildSharedDataText(lists)
+    lists = lists or state.savedLists
+    local lines = { 'return {', '  formatVersion = 2,', '  lists = {' }
     local names = {}
-    for name in pairs(state.savedLists) do names[#names + 1] = name end
+    for name in pairs(lists) do names[#names + 1] = name end
     table.sort(names, function(a, b) return a:lower() < b:lower() end)
     for _, name in ipairs(names) do
-        file:write(string.format('    [%s] = {\n', escapeLuaString(name)))
-        for _, entry in ipairs(state.savedLists[name]) do
-            file:write(string.format('      {name=%s, rank=%s, tab=%d},\n',
-                escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0))
+        lines[#lines + 1] = string.format('    [%s] = {', escapeLuaString(name))
+        for _, entry in ipairs(lists[name]) do
+            lines[#lines + 1] = string.format('      {name=%s, rank=%s, tab=%d},',
+                escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0)
         end
-        file:write('    },\n')
+        lines[#lines + 1] = '    },'
     end
-    file:write('  }\n}\n')
+    lines[#lines + 1] = '  }'
+    lines[#lines + 1] = '}'
+    return table.concat(lines, '\n') .. '\n'
+end
+
+local function buildCharacterDataText()
+    local lines = { 'return {', '  formatVersion = 2,' }
+    lines[#lines + 1] = '  current = {'
+    for _, entry in ipairs(state.plan) do
+        lines[#lines + 1] = string.format('    {name=%s, rank=%s, tab=%d},',
+            escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0)
+    end
+    lines[#lines + 1] = '  },'
+    lines[#lines + 1] = string.format('  compactMode = %s,', tostring(state.compactMode == true))
+    lines[#lines + 1] = string.format('  skipUnmetPrerequisites = %s,', tostring(state.skipUnmetPrerequisites == true))
+    lines[#lines + 1] = string.format('  safetyCheckCasting = %s,', tostring(state.safetyCheckCasting == true))
+    lines[#lines + 1] = string.format('  safetyCheckMoving = %s,', tostring(state.safetyCheckMoving == true))
+    lines[#lines + 1] = string.format('  safetyCheckNavigating = %s,', tostring(state.safetyCheckNavigating == true))
+    lines[#lines + 1] = string.format('  safetyCheckCombat = %s,', tostring(state.safetyCheckCombat == true))
+    lines[#lines + 1] = string.format('  safetyCheckAutofire = %s,', tostring(state.safetyCheckAutofire == true))
+    lines[#lines + 1] = string.format('  safetyCheckXTargets = %s,', tostring(state.safetyCheckXTargets == true))
+    lines[#lines + 1] = '}'
+    return table.concat(lines, '\n') .. '\n'
+end
+
+local function fileExists(path)
+    local file = io.open(path, 'rb')
+    if not file then return false end
     file:close()
-    state.dirty = false
     return true
 end
 
-local function loadSavedData()
-    local chunk = loadfile(saveFile)
-    if not chunk then return end
-    local ok, data = pcall(chunk)
-    if not ok or type(data) ~= 'table' then return end
-    if type(data.classes) == 'table' and #data.classes == 3 then
-        state.classes = data.classes
+local function loadLuaTableFile(path, allowMissing)
+    if not fileExists(path) then
+        if allowMissing then return {}, nil end
+        return nil, 'File does not exist: ' .. tostring(path)
     end
+    local chunk, loadErr = loadfile(path)
+    if not chunk then return nil, 'Could not parse ' .. tostring(path) .. ': ' .. tostring(loadErr) end
+    local ok, data = pcall(chunk)
+    if not ok or type(data) ~= 'table' then
+        return nil, 'Could not load ' .. tostring(path) .. ': ' .. tostring(data)
+    end
+    return data, nil
+end
+
+local function commandSucceeded(a, b, c)
+    if a == true then return true end
+    if type(a) == 'number' then return a == 0 end
+    return b == 'exit' and tonumber(c) == 0
+end
+
+local function shellQuote(path)
+    path = tostring(path or '')
+    if package.config:sub(1, 1) == '\\' then
+        return '"' .. path:gsub('"', '""') .. '"'
+    end
+    return "'" .. path:gsub("'", "'\\''") .. "'"
+end
+
+local function makeDirectory(path)
+    local command
+    if package.config:sub(1, 1) == '\\' then
+        command = 'mkdir ' .. shellQuote(path) .. ' >nul 2>nul'
+    else
+        command = 'mkdir ' .. shellQuote(path) .. ' >/dev/null 2>&1'
+    end
+    local a, b, c = os.execute(command)
+    return commandSucceeded(a, b, c)
+end
+
+local function removeDirectory(path)
+    local command
+    if package.config:sub(1, 1) == '\\' then
+        command = 'rmdir ' .. shellQuote(path) .. ' >nul 2>nul'
+    else
+        command = 'rmdir ' .. shellQuote(path) .. ' >/dev/null 2>&1'
+    end
+    local a, b, c = os.execute(command)
+    return commandSucceeded(a, b, c)
+end
+
+local function readSharedLockOwner()
+    local file = io.open(sharedLockOwnerFile, 'rb')
+    if not file then return nil, nil end
+    local lockTime = tonumber(file:read('*l') or '')
+    local token = trim(file:read('*l') or '')
+    file:close()
+    return lockTime, token ~= '' and token or nil
+end
+
+local function releaseSharedLock(expectedToken, force)
+    if not force and expectedToken then
+        local _, currentToken = readSharedLockOwner()
+        if currentToken and currentToken ~= expectedToken then
+            return false
+        end
+    end
+    os.remove(sharedLockOwnerFile)
+    removeDirectory(sharedLockDir)
+    return true
+end
+
+local function acquireSharedLock(timeoutSeconds)
+    timeoutSeconds = tonumber(timeoutSeconds) or 5
+    local deadline = monotonicSeconds() + timeoutSeconds
+    local character = sanitizeFilePart(mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or '') or 'unknown'
+    local token = string.format('%s_%d_%d_%d', character, os.time(),
+        math.floor(monotonicSeconds() * 1000), math.random(100000, 999999))
+
+    while monotonicSeconds() < deadline do
+        if makeDirectory(sharedLockDir) then
+            local owner, err = io.open(sharedLockOwnerFile, 'wb')
+            if not owner then
+                removeDirectory(sharedLockDir)
+                return false, 'Could not create shared-list lock owner file: ' .. tostring(err)
+            end
+            owner:write(tostring(os.time()), '\n')
+            owner:write(token, '\n')
+            owner:close()
+            return true, token
+        end
+
+        local lockTime = readSharedLockOwner()
+        if lockTime and os.time() - lockTime > 30 then
+            -- A shared-list mutation should take milliseconds. A lock older
+            -- than 30 seconds is treated as abandoned after a crashed client.
+            releaseSharedLock(nil, true)
+        else
+            mq.delay(50)
+        end
+    end
+    return false, 'Timed out waiting for another PTAAPlanner instance to finish updating shared named lists.'
+end
+
+local function makeTempPath(path)
+    local character = sanitizeFilePart(mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or '') or 'unknown'
+    local token = string.format('%s_%d_%d_%d', character, os.time(),
+        math.floor(monotonicSeconds() * 1000), math.random(100000, 999999))
+    return path .. '.tmp.' .. token
+end
+
+local function verifyLuaTableFile(path, verifier)
+    local data, err = loadLuaTableFile(path, false)
+    if not data then return false, err end
+    if verifier then
+        local verified, verifyErr = verifier(data)
+        if not verified then return false, verifyErr or 'Verification failed.' end
+    end
+    return true
+end
+
+local function replaceFileFromTemp(tempPath, destinationPath)
+    -- POSIX os.rename replaces atomically. On Windows it normally refuses to
+    -- replace an existing destination, so try MoveFileExW via LuaJIT FFI first.
+    local renamed = os.rename(tempPath, destinationPath)
+    if renamed then return true end
+
+    if package.config:sub(1, 1) == '\\' then
+        local ffiOK, ffi = pcall(require, 'ffi')
+        if ffiOK and ffi then
+            pcall(function()
+                ffi.cdef[[
+                    int MoveFileExA(const char *lpExistingFileName, const char *lpNewFileName, unsigned long dwFlags);
+                ]]
+            end)
+            local kernelOK, kernel32 = pcall(ffi.load, 'kernel32')
+            if kernelOK and kernel32 then
+                local ok, result = pcall(function()
+                    return kernel32.MoveFileExA(tempPath, destinationPath, 0x00000001 + 0x00000008)
+                end)
+                if ok and tonumber(result) ~= 0 then return true end
+            end
+        end
+    end
+
+    -- Last-resort fallback for runtimes without replacement-capable rename.
+    -- The fully written and verified temp file is preserved until this point,
+    -- so this avoids ever exposing a partially written destination.
+    os.remove(destinationPath)
+    local ok, err = os.rename(tempPath, destinationPath)
+    if ok then return true end
+    return false, 'Could not replace destination file: ' .. tostring(err)
+end
+
+local function writeVerifiedLuaTable(path, text, verifier)
+    if not path then return false, 'Character/server identity is not available yet.' end
+
+    local tempPath = makeTempPath(path)
+    local file, err = io.open(tempPath, 'wb')
+    if not file then return false, err end
+
+    local writeOK, writeErr = pcall(function()
+        file:write(text)
+        file:flush()
+        file:close()
+    end)
+    if not writeOK then
+        pcall(function() file:close() end)
+        os.remove(tempPath)
+        return false, 'Temporary write failed: ' .. tostring(writeErr)
+    end
+
+    local verified, verifyErr = verifyLuaTableFile(tempPath, verifier)
+    if not verified then
+        os.remove(tempPath)
+        return false, 'Temporary-file verification failed: ' .. tostring(verifyErr)
+    end
+
+    local replaced, replaceErr = replaceFileFromTemp(tempPath, path)
+    if not replaced then
+        os.remove(tempPath)
+        return false, replaceErr
+    end
+
+    local finalVerified, finalErr = verifyLuaTableFile(path, verifier)
+    if not finalVerified then
+        return false, 'Final verification failed: ' .. tostring(finalErr)
+    end
+    return true
+end
+
+local function readSharedData()
+    local data, err = loadLuaTableFile(sharedSaveFile, true)
+    if not data then return nil, err end
+    if data.lists == nil then data.lists = {} end
+    if type(data.lists) ~= 'table' then
+        return nil, 'Shared named-list file contains an invalid lists value.'
+    end
+    return data, nil
+end
+
+local function refreshSharedListsFromDisk()
+    local data = readSharedData()
+    if not data then return false end
+    state.savedLists = copySavedLists(data.lists)
+    if state.selectedSaved ~= '' and not state.savedLists[state.selectedSaved] then
+        state.selectedSaved = ''
+    end
+    return true
+end
+
+local function mutateSharedLists(description, mutation)
+    local locked, lockTokenOrErr = acquireSharedLock(5)
+    if not locked then return false, lockTokenOrErr end
+    local lockToken = lockTokenOrErr
+
+    local callOK, success, resultOrError = pcall(function()
+        -- Re-read only after the lock is held. This is what prevents a stale
+        -- PTAAPlanner instance from overwriting another instance's changes.
+        local data, readErr = readSharedData()
+        if not data then return false, readErr end
+
+        local lists = copySavedLists(data.lists)
+        local shouldWrite, mutationResult = mutation(lists, data)
+        if shouldWrite == false then
+            state.savedLists = lists
+            return true, mutationResult
+        end
+
+        local expectedLists = copySavedLists(lists)
+        local ok, writeErr = writeVerifiedLuaTable(sharedSaveFile, buildSharedDataText(expectedLists), function(written)
+            if type(written.lists) ~= 'table' then
+                return false, 'Shared-list verification failed: lists table missing.'
+            end
+            local expectedCount, actualCount = 0, 0
+            for _ in pairs(expectedLists) do expectedCount = expectedCount + 1 end
+            for _ in pairs(written.lists) do actualCount = actualCount + 1 end
+            if actualCount ~= expectedCount then
+                return false, string.format('Shared-list verification failed: expected %d lists, read back %d.',
+                    expectedCount, actualCount)
+            end
+            for name, expectedPlan in pairs(expectedLists) do
+                local actualPlan = written.lists[name]
+                if type(actualPlan) ~= 'table' or #actualPlan ~= #expectedPlan then
+                    return false, 'Shared-list verification failed for "' .. tostring(name) .. '".'
+                end
+            end
+            return true
+        end)
+        if not ok then return false, writeErr end
+
+        local finalData, finalErr = readSharedData()
+        if not finalData then return false, finalErr end
+        state.savedLists = copySavedLists(finalData.lists)
+        return true, mutationResult
+    end)
+
+    releaseSharedLock(lockToken)
+
+    if not callOK then
+        return false, string.format('Shared-list update "%s" failed: %s', tostring(description), tostring(success))
+    end
+    return success, resultOrError
+end
+
+local function saveNamedList(name, plan)
+    return mutateSharedLists('save ' .. tostring(name), function(lists)
+        lists[name] = copyPlan(plan)
+        return true
+    end)
+end
+
+local function deleteNamedList(name)
+    return mutateSharedLists('delete ' .. tostring(name), function(lists)
+        lists[name] = nil
+        return true
+    end)
+end
+
+local function migrateLegacySharedCurrent()
+    local migratedName = nil
+    local ok, err = mutateSharedLists('migrate v0.2 working list', function(lists, data)
+        if type(data.current) ~= 'table' or #data.current == 0 then
+            return false
+        end
+        local baseName = 'Migrated v0.2 Working List'
+        migratedName = baseName
+        local suffix = 2
+        while lists[migratedName] do
+            migratedName = string.format('%s (%d)', baseName, suffix)
+            suffix = suffix + 1
+        end
+        lists[migratedName] = copyPlan(data.current)
+        return true
+    end)
+    return ok, err, migratedName
+end
+
+local function writeCharacterData()
+    local path = resolveCharacterSaveFile()
+    local expectedPlanCount = #state.plan
+    local ok, err = writeVerifiedLuaTable(path, buildCharacterDataText(), function(data)
+        if type(data.current) ~= 'table' then return false, 'Character-state verification failed: current list missing.' end
+        if #data.current ~= expectedPlanCount then
+            return false, string.format('Character-state verification failed: expected %d priorities, read back %d.', expectedPlanCount, #data.current)
+        end
+        if data.skipUnmetPrerequisites ~= (state.skipUnmetPrerequisites == true) then
+            return false, 'Character-state verification failed: prerequisite-skip setting did not match.'
+        end
+        return true
+    end)
+    if ok then state.dirty = false end
+    return ok, err
+end
+
+local function loadCharacterSettings(data)
     if type(data.current) == 'table' then state.plan = copyPlan(data.current) end
     if type(data.compactMode) == 'boolean' then state.compactMode = data.compactMode end
-    if type(data.consumeExperience) == 'boolean' then state.consumeExperience = data.consumeExperience end
-    if tonumber(data.consumeExperienceThreshold) then
-        state.consumeExperienceThreshold = math.max(1, math.floor(tonumber(data.consumeExperienceThreshold)))
+    if type(data.skipUnmetPrerequisites) == 'boolean' then
+        state.skipUnmetPrerequisites = data.skipUnmetPrerequisites
     end
     if type(data.safetyCheckCasting) == 'boolean' then state.safetyCheckCasting = data.safetyCheckCasting end
     if type(data.safetyCheckMoving) == 'boolean' then state.safetyCheckMoving = data.safetyCheckMoving end
@@ -189,13 +522,49 @@ local function loadSavedData()
     if type(data.safetyCheckCombat) == 'boolean' then state.safetyCheckCombat = data.safetyCheckCombat end
     if type(data.safetyCheckAutofire) == 'boolean' then state.safetyCheckAutofire = data.safetyCheckAutofire end
     if type(data.safetyCheckXTargets) == 'boolean' then state.safetyCheckXTargets = data.safetyCheckXTargets end
-    if type(data.lists) == 'table' then
-        for name, list in pairs(data.lists) do
-            if type(name) == 'string' and type(list) == 'table' then
-                state.savedLists[name] = copyPlan(list)
-            end
+end
+
+local function loadSavedData()
+    local sharedData, sharedErr = readSharedData()
+    if sharedData then
+        state.savedLists = copySavedLists(sharedData.lists)
+    elseif sharedErr then
+        print('\ar[AA Planner]\ax Could not load shared named lists: ' .. tostring(sharedErr))
+    end
+
+    local path = resolveCharacterSaveFile()
+    local characterData = nil
+    if path and fileExists(path) then
+        local data, err = loadLuaTableFile(path, false)
+        if data then
+            characterData = data
+            loadCharacterSettings(data)
+        else
+            print('\ar[AA Planner]\ax Could not load character state: ' .. tostring(err))
         end
     end
+    if characterData then return end
+
+    -- v0.2 stored one working queue for every character in a shared file.
+    -- Migrate it while holding the shared-list lock so simultaneous clients
+    -- cannot create duplicate migration lists or overwrite each other's data.
+    local migrationOK, migrationErr, migrationName = migrateLegacySharedCurrent()
+    if migrationOK and migrationName then
+        print('\at[AA Planner]\ax Preserved the old shared v0.2 working queue as "' .. migrationName .. '". New character queues now start independently.')
+    elseif not migrationOK then
+        print('\ar[AA Planner]\ax Could not persist migrated v0.2 working list: ' .. tostring(migrationErr))
+    end
+
+    -- Legacy non-queue settings are safe to use as initial defaults for a
+    -- character that does not have its own state file yet.
+    if sharedData then
+        local legacyCurrent = sharedData.current
+        sharedData.current = nil
+        loadCharacterSettings(sharedData)
+        sharedData.current = legacyCurrent
+    end
+    state.plan = {}
+    state.dirty = true
 end
 
 local function markDirty()
@@ -204,72 +573,7 @@ end
 
 local function markPlanDirty()
     state.dirty = true
-end
-
-local function normalizeClass(text)
-    local value = trim(text):upper():gsub('[%s_%-]', '')
-    if value == '' then return nil end
-    if CLASS_LOOKUP[value] then return CLASS_LOOKUP[value] end
-    for word in trim(text):upper():gmatch('%a+') do
-        if CLASS_LOOKUP[word] then return CLASS_LOOKUP[word] end
-    end
-    return nil
-end
-
-local function addUniqueClass(found, value)
-    local cls = normalizeClass(value)
-    if not cls then return end
-    for _, existing in ipairs(found) do
-        if existing == cls then return end
-    end
-    if #found < 3 then found[#found + 1] = cls end
-end
-
-local function readClassControl(control, found)
-    if not control or not control() then return end
-    pcall(function()
-        local text = control.Text()
-        if text and text ~= '' and text ~= 'NULL' then
-            for line in tostring(text):gmatch('[^\r\n]+') do addUniqueClass(found, line) end
-        end
-    end)
-    pcall(function()
-        local count = tonumber(control.Items() or 0) or 0
-        for row = 1, math.min(count, 10) do
-            local text = control.List(row)()
-            if text and text ~= '' and text ~= 'NULL' then addUniqueClass(found, text) end
-        end
-    end)
-end
-
-local function detectClasses()
-    local wasOpen = false
-    pcall(function() wasOpen = mq.TLO.Window('InventoryWindow').Open() == true end)
-    if not wasOpen then
-        mq.cmd('/windowstate InventoryWindow open')
-        mq.delay(250)
-    end
-
-    local found = {}
-    pcall(function()
-        local inventory = mq.TLO.Window('InventoryWindow')
-        if not inventory or not inventory() then return end
-        for _, childName in ipairs({ 'IW_ClassAbbr', 'IW_Class', 'IW_ClassList' }) do
-            readClassControl(inventory.Child(childName), found)
-            if #found == 3 then break end
-        end
-    end)
-
-    if not wasOpen then mq.cmd('/windowstate InventoryWindow close') end
-    if #found == 3 then
-        state.classes = found
-        state.classDetected = true
-        markDirty()
-        setStatus('Detected classes: ' .. table.concat(found, ' / '), 'good')
-    else
-        state.classDetected = false
-        setStatus('Class autodetection did not return three classes. Use the manual selectors.', 'warn')
-    end
+    state.planGeneration = (tonumber(state.planGeneration) or 0) + 1
 end
 
 local function safeAAValue(aa, member, default)
@@ -295,9 +599,30 @@ local function getAAProgress(name)
     local rank = tonumber(safeAAValue(personal, 'Rank', 0)) or 0
     local maxRank = tonumber(safeAAValue(personal, 'MaxRank', 0)) or 0
     if maxRank <= 0 then maxRank = tonumber(safeAAValue(global, 'MaxRank', 0)) or 0 end
+
+    local cached = state.catalogByName[tostring(name or ''):lower()]
+    local windowCost = cached and tonumber(cached.windowCost or 0) or 0
+    local windowRank = cached and tonumber(cached.windowRank) or nil
+
+    -- On Triune, AltAbility.Cost can describe the rank just purchased rather
+    -- than the next purchasable rank. The AA window's Cost column is the
+    -- authoritative next-rank price whenever its observed rank matches the
+    -- character's live current rank.
+    if windowCost > 0 and windowRank ~= nil and windowRank == rank then
+        return rank, maxRank, windowCost, 'AAWindow'
+    end
+
     local cost = tonumber(safeAAValue(personal, 'Cost', 0)) or 0
-    if cost <= 0 then cost = tonumber(safeAAValue(global, 'Cost', 0)) or 0 end
-    return rank, maxRank, cost
+    if cost > 0 then
+        return rank, maxRank, cost, 'PersonalTLO'
+    end
+
+    cost = tonumber(safeAAValue(global, 'Cost', 0)) or 0
+    if cost > 0 then
+        return rank, maxRank, cost, 'GlobalTLO'
+    end
+
+    return rank, maxRank, 0, 'Unresolved'
 end
 
 local function getEntryTarget(entry, maxRank)
@@ -340,6 +665,215 @@ local function remainingCostForEntry(entry)
     return total, complete
 end
 
+
+-- Prerequisite handling intentionally separates structural AA metadata from
+-- character-specific trained rank data.
+--
+-- On Project Triune we verified in-game that the global AltAbility object
+-- (mq.TLO.AltAbility) reliably exposes RequiresAbility and
+-- RequiresAbilityPoints and matches the prerequisite text shown in the AA
+-- window. However, its Rank member is NOT the character's trained rank; for
+-- example, global AltAbility("First Aid").Rank reported 0 while the character
+-- visibly had First Aid 3/3.
+--
+-- Therefore:
+--   * mq.TLO.AltAbility(...) is used only for structural prerequisite metadata.
+--   * mq.TLO.Me.AltAbility(...) is used for the live character-owned rank.
+--
+-- Do not collapse these two reads into one source. The distinction is required
+-- for correct prerequisite evaluation on Triune.
+local function getPrerequisiteStructure(name)
+    local key = tostring(name or ''):lower()
+    if key == '' then return nil, 'AA name is empty' end
+
+    -- Prerequisite metadata can be rank-specific. Cache it for the current
+    -- rank of the requested AA, not merely for the AA name. After that AA is
+    -- trained, its next rank gets one fresh structural read automatically.
+    local requestedRank = select(1, getAAProgress(name))
+    requestedRank = tonumber(requestedRank) or 0
+
+    local cached = state.prerequisiteCache[key]
+    if cached
+        and tonumber(cached.generation) == tonumber(state.catalogGeneration)
+        and tonumber(cached.requestedRank) == requestedRank then
+        return cached
+    end
+
+    local global = mq.TLO.AltAbility(name)
+    if not global or not global() then
+        state.prerequisiteCache[key] = nil
+        return nil, 'global AltAbility did not resolve'
+    end
+
+    local requiredID = tonumber(safeAAValue(global, 'RequiresAbility', 0)) or 0
+    local requiredRank = tonumber(safeAAValue(global, 'RequiresAbilityPoints', 0)) or 0
+
+    if requiredID <= 0 then
+        local result = {
+            generation = state.catalogGeneration,
+            requestedRank = requestedRank,
+            hasPrerequisite = false,
+        }
+        state.prerequisiteCache[key] = result
+        return result
+    end
+
+    if requiredRank <= 0 then
+        state.prerequisiteCache[key] = nil
+        return nil, string.format('RequiresAbility=%d but RequiresAbilityPoints=%s',
+            requiredID, tostring(requiredRank))
+    end
+
+    local prerequisiteGlobal = mq.TLO.AltAbility(requiredID)
+    if not prerequisiteGlobal or not prerequisiteGlobal() then
+        state.prerequisiteCache[key] = nil
+        return nil, string.format('prerequisite AA ID %d did not resolve', requiredID)
+    end
+
+    local requiredName = trim(safeAAValue(prerequisiteGlobal, 'Name', ''))
+    if requiredName == '' then
+        state.prerequisiteCache[key] = nil
+        return nil, string.format('prerequisite AA ID %d resolved without a name', requiredID)
+    end
+
+    local result = {
+        generation = state.catalogGeneration,
+        requestedRank = requestedRank,
+        hasPrerequisite = true,
+        requiredID = requiredID,
+        requiredName = requiredName,
+        requiredRank = requiredRank,
+    }
+    state.prerequisiteCache[key] = result
+    return result
+end
+
+local function getCharacterAARank(name, id)
+    -- Character ownership/rank MUST NOT come from global AltAbility.Rank.
+    -- On Triune that value was observed returning 0 for already-trained AAs.
+    --
+    -- Prefer Me.AltAbility for trained/current character rank. However,
+    -- Triune may return no personal AltAbility object at all for an untrained
+    -- AA. In that case, a freshly observed AA-window row is authoritative for
+    -- the visible current rank (commonly 0). This lets us distinguish
+    -- "known and untrained" from "rank could not be resolved" without ever
+    -- falling back to the unreliable global Rank field.
+    local personal = mq.TLO.Me.AltAbility(name)
+    if personal and personal() then
+        local rank = tonumber(safeAAValue(personal, 'Rank', nil))
+        if rank ~= nil then return rank, 'Me.AltAbility(name)' end
+    end
+
+    if tonumber(id) and tonumber(id) > 0 then
+        personal = mq.TLO.Me.AltAbility(tonumber(id))
+        if personal and personal() then
+            local rank = tonumber(safeAAValue(personal, 'Rank', nil))
+            if rank ~= nil then return rank, 'Me.AltAbility(id)' end
+        end
+    end
+
+    local cached = state.catalogByName[tostring(name or ''):lower()]
+    if cached and cached.windowRank ~= nil then
+        local rank = tonumber(cached.windowRank)
+        if rank ~= nil then
+            return rank, 'AAWindow'
+        end
+    end
+
+    return nil, nil
+end
+
+local function getPrerequisiteStatus(name)
+    local structure, structureError = getPrerequisiteStructure(name)
+    if not structure then
+        return 'unknown', {
+            reason = structureError or 'prerequisite structure could not be resolved',
+        }
+    end
+
+    if not structure.hasPrerequisite then
+        return 'none', {
+            hasPrerequisite = false,
+        }
+    end
+
+    local currentRank, rankSource = getCharacterAARank(structure.requiredName, structure.requiredID)
+    if currentRank == nil then
+        return 'unknown', {
+            hasPrerequisite = true,
+            requiredID = structure.requiredID,
+            requiredName = structure.requiredName,
+            requiredRank = structure.requiredRank,
+            reason = 'character prerequisite rank could not be resolved',
+        }
+    end
+
+    local info = {
+        hasPrerequisite = true,
+        requiredID = structure.requiredID,
+        requiredName = structure.requiredName,
+        requiredRank = structure.requiredRank,
+        currentRank = currentRank,
+        rankSource = rankSource,
+    }
+
+    if currentRank < structure.requiredRank then
+        return 'unmet', info
+    end
+
+    return 'met', info
+end
+
+local function evaluateQueue()
+    state.prerequisiteRuntimeStatus = {}
+    local skippedCount = 0
+
+    for _, entry in ipairs(state.plan) do
+        local rank, maxRank, cost = getAAProgress(entry.name)
+        local target = getEntryTarget(entry, maxRank)
+
+        if target <= 0 then
+            return entry, rank, maxRank, cost,
+                'target rank could not be resolved',
+                { state = 'candidate', skippedCount = skippedCount }
+        end
+
+        if rank < target then
+            local skipThisEntry = false
+
+            if state.skipUnmetPrerequisites then
+                local prereqState, prereqInfo = getPrerequisiteStatus(entry.name)
+                state.prerequisiteRuntimeStatus[entry.name:lower()] = {
+                    state = prereqState,
+                    info = prereqInfo,
+                }
+
+                -- This is intentionally the ONLY condition that may bypass an
+                -- incomplete queue entry. CanTrain=false is ambiguous on
+                -- Triune (insufficient points also reports not trainable), so
+                -- unknown prerequisite data must retain normal queue priority.
+                if prereqState == 'unmet' then
+                    skippedCount = skippedCount + 1
+                    skipThisEntry = true
+                end
+            end
+
+            if not skipThisEntry then
+                return entry, rank, maxRank, cost, nil,
+                    { state = 'candidate', skippedCount = skippedCount }
+            end
+        end
+    end
+
+    if skippedCount > 0 then
+        return nil, nil, nil, nil, nil,
+            { state = 'all_blocked', skippedCount = skippedCount }
+    end
+
+    return nil, nil, nil, nil, nil,
+        { state = 'complete', skippedCount = 0 }
+end
+
 local function recalculatePlannerStats()
     state.aaPoints = getCurrentAAPoints()
     local total = 0
@@ -354,14 +888,12 @@ local function recalculatePlannerStats()
 end
 
 local function getTopPriorityCost()
-    for _, entry in ipairs(state.plan) do
-        local rank, maxRank, cost = getAAProgress(entry.name)
-        local target = getEntryTarget(entry, maxRank)
-        if target > 0 and rank < target then
-            return math.max(0, tonumber(cost) or 0), entry.name, rank, target
-        end
+    local entry, rank, maxRank, cost, resolveError, queueState = evaluateQueue()
+    if entry then
+        return math.max(0, tonumber(cost) or 0), entry.name, rank,
+            getEntryTarget(entry, maxRank), resolveError, queueState
     end
-    return 0, nil, 0, 0
+    return 0, nil, 0, 0, nil, queueState
 end
 
 local function pruneCompletedPlan()
@@ -373,53 +905,56 @@ local function pruneCompletedPlan()
         end
     end
     if #removed > 0 then
-        state.dirty = true
+        markPlanDirty()
         print(string.format('\at[AA Planner]\ax Removed completed AA%s from priority list: %s',
             #removed == 1 and '' or 's', table.concat(removed, ', ')))
     end
     return #removed
 end
 
-local function recordAA(name, forcedTab)
+local function recordAAFromWindow(name, sourceTab, observedRank, observedCost)
     name = trim(name)
-    if name == '' or tonumber(name) or state.catalogByName[name:lower()] then return end
+    sourceTab = tonumber(sourceTab) or 0
+    if name == '' or tonumber(name) or state.catalogByName[name:lower()] then return false end
+    if not TAB_NAMES[sourceTab] then return false end
 
+    -- Catalog membership comes only from a row actually observed in the
+    -- character's AA window. MacroQuest AltAbility data is used only to enrich
+    -- that observed row with rank/cost/trainability metadata.
     local personal = mq.TLO.Me.AltAbility(name)
     local global = mq.TLO.AltAbility(name)
-    local personalExists = false
-    pcall(function() personalExists = personal and personal() ~= nil end)
-    -- The global AltAbility TLO contains every class's AAs. For database
-    -- discovery, only accept entries associated with this character. An AA
-    -- read from the character's visible AA window is already authoritative.
-    if not forcedTab and not personalExists then return end
+
     local rank = tonumber(safeAAValue(personal, 'Rank', 0)) or 0
     local maxRank = tonumber(safeAAValue(personal, 'MaxRank', 0)) or 0
     if maxRank <= 0 then maxRank = tonumber(safeAAValue(global, 'MaxRank', 0)) or 0 end
-    local aaType = tonumber(safeAAValue(personal, 'Type', 0)) or 0
-    if aaType <= 0 then aaType = tonumber(safeAAValue(global, 'Type', 0)) or 0 end
-    if aaType <= 0 then aaType = tonumber(forcedTab) or 0 end
-    if not TAB_NAMES[aaType] then return end
 
     local id = tonumber(safeAAValue(personal, 'ID', 0)) or 0
     if id <= 0 then id = tonumber(safeAAValue(global, 'ID', 0)) or 0 end
+
     local cost = tonumber(safeAAValue(personal, 'Cost', 0)) or 0
     if cost <= 0 then cost = tonumber(safeAAValue(global, 'Cost', 0)) or 0 end
+
     local canTrain = safeAAValue(personal, 'CanTrain', false) == true
     if not canTrain then canTrain = safeAAValue(global, 'CanTrain', false) == true end
 
-    if id <= 0 and maxRank <= 0 and rank <= 0 and cost <= 0 and not canTrain then return end
+    -- A list row can contain non-name columns (rank/cost/header text). Require
+    -- the row text to resolve to meaningful AA metadata before cataloging it.
+    if id <= 0 and maxRank <= 0 and rank <= 0 and cost <= 0 and not canTrain then return false end
 
     local entry = {
         name = name,
-        tab = aaType,
+        tab = sourceTab,
         rank = rank,
         maxRank = maxRank,
         cost = cost,
         canTrain = canTrain,
         maxed = maxRank > 0 and rank >= maxRank,
+        windowRank = tonumber(observedRank),
+        windowCost = math.max(0, tonumber(observedCost) or 0),
     }
     state.catalog[#state.catalog + 1] = entry
     state.catalogByName[name:lower()] = entry
+    return true
 end
 
 local function getAAWindow()
@@ -431,54 +966,225 @@ local function getAAWindow()
     return nil, nil
 end
 
-local function scanAAListControl(control, forcedTab, stats)
-    if not control or not control() then return end
+local function getAATabBox(window)
+    if not window or not window() then return nil end
+
+    for _, name in ipairs({ 'AAW_Subwindows', 'Subwindows' }) do
+        local child
+        pcall(function() child = window.Child(name) end)
+        if child and child() then return child end
+    end
+
+    -- Custom UIs can nest the tab box. ScreenID remains stable across custom
+    -- UIs, so walk descendants looking first for the expected identifiers and
+    -- then for a TabBox with General/Archetype/Class pages.
+    local function walk(node, depth, visited)
+        if not node or not node() or depth > 18 or visited.count > 750 then return nil end
+        visited.count = visited.count + 1
+
+        local name, screenID, controlType
+        pcall(function() name = node.Name() end)
+        pcall(function() screenID = node.ScreenID() end)
+        pcall(function() controlType = node.Type() end)
+
+        local lowerName = tostring(name or ''):lower()
+        local lowerID = tostring(screenID or ''):lower()
+        if lowerName == 'aaw_subwindows' or lowerName == 'subwindows' or
+           lowerID == 'aaw_subwindows' or lowerID == 'subwindows' then
+            return node
+        end
+
+        if tostring(controlType or ''):lower() == 'tabbox' then
+            local hasExpectedPages = false
+            for _, tabName in ipairs({ 'General', 'Archetype', 'Class' }) do
+                local page
+                pcall(function() page = node.Tab(tabName) end)
+                if page and page() then
+                    hasExpectedPages = true
+                    break
+                end
+            end
+            if hasExpectedPages then return node end
+        end
+
+        local child
+        pcall(function() child = node.FirstChild end)
+        while child and child() and visited.count <= 750 do
+            local found = walk(child, depth + 1, visited)
+            if found then return found end
+            local nextChild
+            pcall(function() nextChild = child.Next end)
+            if not nextChild or not nextChild() then break end
+            child = nextChild
+        end
+        return nil
+    end
+
+    return walk(window, 0, { count = 0 })
+end
+
+local function getCurrentAATabPage(tabBox)
+    if not tabBox or not tabBox() then return nil end
+
+    -- CurrentTab is a window-typed member. Keep the MacroQuest datatype
+    -- object itself; calling CurrentTab() evaluates it to its string value
+    -- (the Page's ToString), which is no longer usable as a window object.
+    local page
+    pcall(function() page = tabBox.CurrentTab end)
+    if page and page() then return page end
+    return nil
+end
+
+local function getAATabPageText(page)
+    if not page or not page() then return '' end
+    local value = ''
+    pcall(function() value = trim(page.Text() or '') end)
+    if value == 'NULL' then return '' end
+    return value
+end
+
+local function selectAATabForCatalog(window, windowName, tabBox, tab, expectedName)
+    if not tabBox or not tabBox() then return false, 'AA tab control was not found.' end
+
+    -- Prefer selecting by text because it remains meaningful if the client
+    -- changes numeric tab ordering. Fall back to the existing /notify path.
+    pcall(function()
+        if tabBox.SetCurrentTab then tabBox.SetCurrentTab(expectedName) end
+    end)
+
+    mq.delay(100)
+
+    local page = getCurrentAATabPage(tabBox)
+    local pageText = getAATabPageText(page)
+    if pageText:lower() == expectedName:lower() then return true end
+
+    mq.cmdf('/nomodkey /notify %s AAW_Subwindows tabselect %d', windowName, tab)
+    mq.cmdf('/nomodkey /notify %s Subwindows tabselect %d', windowName, tab)
+    pcall(function()
+        if tabBox.SetCurrentTab then tabBox.SetCurrentTab(tab) end
+    end)
+
+    mq.delay(150)
+
+    page = getCurrentAATabPage(tabBox)
+    pageText = getAATabPageText(page)
+    if page and page() and (pageText == '' or pageText:lower() == expectedName:lower()) then
+        return true
+    end
+
+    return false, string.format('Could not select AA tab %s; active page was "%s".',
+        expectedName, pageText ~= '' and pageText or '<unknown>')
+end
+
+local function scanAAListControl(control, sourceTab, stats)
+    if not control or not control() or not TAB_NAMES[sourceTab] then return 0 end
+
+    local controlType = ''
+    pcall(function() controlType = tostring(control.Type() or '') end)
+    controlType = controlType:lower()
+    if controlType ~= 'listbox' and controlType ~= 'treeview' and controlType ~= 'combobox' then
+        return 0
+    end
+
     local count = 0
     pcall(function() count = tonumber(control.Items() or 0) or 0 end)
-    if count <= 0 or count > 1000 then return end
+    if count <= 0 or count > 1000 then return 0 end
 
     stats.listControls = stats.listControls + 1
     stats.rows = stats.rows + count
+    stats.tabRows[sourceTab] = (stats.tabRows[sourceTab] or 0) + count
+
+    local added = 0
     for row = 1, count do
+        local cells = {}
         local foundCell = false
-        -- Column 1 is the AA title on Project Triune. Reading the other columns
-        -- makes this tolerant of custom UI layouts that shift the title column;
-        -- non-AA values are discarded by recordAA().
+
         for column = 1, 5 do
             local value
             pcall(function() value = control.List(row, column)() end)
-            if value and value ~= '' and value ~= 'NULL' then
+            value = trim(value)
+            cells[column] = value
+            if value ~= '' and value ~= 'NULL' then
                 stats.cells = stats.cells + 1
                 foundCell = true
-                recordAA(value, forcedTab)
             end
         end
+
         if not foundCell then
             local value
             pcall(function() value = control.List(row)() end)
-            if value and value ~= '' and value ~= 'NULL' then
+            value = trim(value)
+            if value ~= '' and value ~= 'NULL' then
                 stats.cells = stats.cells + 1
-                recordAA(value, forcedTab)
+                cells[1] = value
+                foundCell = true
+            end
+        end
+
+        if foundCell then
+            local observedRank
+            local observedMax
+            if cells[2] and cells[2] ~= '' then
+                local currentText, maxText = cells[2]:match('^%s*(%d+)%s*/%s*(%d+)%s*$')
+                observedRank = tonumber(currentText)
+                observedMax = tonumber(maxText)
+            end
+
+            local observedCost = tonumber(cells[3] or '')
+            local title = cells[1]
+
+            -- Normal AA rows are Title | Cur/Max | Cost | Category. Feed the
+            -- observed rank/cost into the catalog so they are available as a
+            -- fallback when the TLO reports Cost=0.
+            if title and title ~= '' and title ~= 'NULL' then
+                if recordAAFromWindow(title, sourceTab, observedRank, observedCost) then
+                    added = added + 1
+                    local cached = state.catalogByName[title:lower()]
+                    if cached and observedMax and cached.maxRank <= 0 then
+                        cached.maxRank = observedMax
+                    end
+                end
             end
         end
     end
+
+    stats.tabAAs[sourceTab] = (stats.tabAAs[sourceTab] or 0) + added
+    return added
 end
 
-local function walkAAWindowControls(node, stats, depth, visited)
-    if not node or not node() or depth > 18 or visited.count > 750 then return end
-    scanAAListControl(node, 1, stats)
+local function scanAATabPage(page, sourceTab, stats)
+    if not page or not page() then return end
 
-    local child
-    local ok = pcall(function() child = node.FirstChild end)
-    if not ok or not child or not child() then return end
-    while child and child() and visited.count <= 750 do
+    local visited = { count = 0 }
+    local scanned = {}
+
+    local function walk(node, depth)
+        if not node or not node() or depth > 18 or visited.count > 1000 then return end
         visited.count = visited.count + 1
-        walkAAWindowControls(child, stats, depth + 1, visited)
-        local nextChild
-        local nextOK = pcall(function() nextChild = child.Next end)
-        if not nextOK or not nextChild or not nextChild() then break end
-        child = nextChild
+
+        local controlType = ''
+        pcall(function() controlType = tostring(node.Type() or ''):lower() end)
+        if controlType == 'listbox' or controlType == 'treeview' or controlType == 'combobox' then
+            local key = tostring(node)
+            if not scanned[key] then
+                scanned[key] = true
+                scanAAListControl(node, sourceTab, stats)
+            end
+        end
+
+        local child
+        pcall(function() child = node.FirstChild end)
+        while child and child() and visited.count <= 1000 do
+            walk(child, depth + 1)
+            local nextChild
+            pcall(function() nextChild = child.Next end)
+            if not nextChild or not nextChild() then break end
+            child = nextChild
+        end
     end
+
+    walk(page, 0)
+    stats.controls = stats.controls + visited.count
 end
 
 local function scanAAWindow()
@@ -491,61 +1197,101 @@ local function scanAAWindow()
         window, windowName = getAAWindow()
     end
 
-    local stats = { window = windowName or 'none', listControls = 0, rows = 0, cells = 0, controls = 0 }
-    pcall(function()
-        if not window or not window() then return end
-        local lists = {
-            [1] = { 'List1', 'AAW_GeneralList', 'AA_GeneralList', 'GeneralList' },
-            [2] = { 'List2', 'AAW_ArchetypeList', 'AA_ArchetypeList', 'ArchetypeList' },
-            [3] = { 'List3', 'AAW_ClassList', 'AA_ClassList', 'ClassList' },
-        }
-        for tab, candidates in pairs(lists) do
-            for _, childName in ipairs(candidates) do
-                local child = window.Child(childName)
-                if child and child() then
-                    scanAAListControl(child, tab, stats)
-                end
-            end
-        end
+    local stats = {
+        window = windowName or 'none',
+        listControls = 0,
+        rows = 0,
+        cells = 0,
+        controls = 0,
+        tabRows = { [1] = 0, [2] = 0, [3] = 0 },
+        tabAAs = { [1] = 0, [2] = 0, [3] = 0 },
+        tabErrors = {},
+    }
 
-        -- Triune and custom EverQuest UIs do not always retain the standard
-        -- list-control names. Walk every descendant and let AltAbility lookup
-        -- distinguish AA titles from headers, costs, and category strings.
-        local visited = { count = 0 }
-        walkAAWindowControls(window, stats, 0, visited)
-        stats.controls = visited.count
-    end)
+    if not window or not window() then
+        state.scanStats = stats
+        return
+    end
+
+    local tabBox = getAATabBox(window)
+    if not tabBox or not tabBox() then
+        stats.tabErrors[#stats.tabErrors + 1] = 'Could not locate the AA tab control.'
+        state.scanStats = stats
+        if not wasOpen then mq.cmd('/windowstate AAWindow close') end
+        return
+    end
+
+    local originalPage = getCurrentAATabPage(tabBox)
+    local originalTabName = getAATabPageText(originalPage)
+
+    -- The EQ AA window lazily populates/reuses controls according to the active
+    -- page. Select each category before reading its page so the catalog reflects
+    -- what the character actually sees in that category.
+    for tab = 1, 3 do
+        local expectedName = TAB_NAMES[tab]
+        local selected, selectErr = selectAATabForCatalog(window, windowName or 'AAWindow',
+            tabBox, tab, expectedName)
+
+        if selected then
+            -- Reacquire after changing tabs because the client may rebuild page
+            -- controls when the selection changes.
+            window, windowName = getAAWindow()
+            tabBox = getAATabBox(window)
+            local page = getCurrentAATabPage(tabBox)
+            local pageText = getAATabPageText(page)
+
+            if page and page() and (pageText == '' or pageText:lower() == expectedName:lower()) then
+                scanAATabPage(page, tab, stats)
+            else
+                stats.tabErrors[#stats.tabErrors + 1] = string.format(
+                    '%s tab verification failed; active page was "%s".',
+                    expectedName, pageText ~= '' and pageText or '<unknown>')
+            end
+        else
+            stats.tabErrors[#stats.tabErrors + 1] = selectErr
+        end
+    end
+
+    -- Restore the tab the player had open when possible.
+    if originalTabName ~= '' then
+        pcall(function()
+            tabBox = getAATabBox(getAAWindow())
+            if tabBox and tabBox.SetCurrentTab then tabBox.SetCurrentTab(originalTabName) end
+        end)
+    end
 
     state.scanStats = stats
 
     if not wasOpen then mq.cmd('/windowstate AAWindow close') end
 end
 
-local function scanAADatabase()
-    -- Early-era and emulator AA IDs are concentrated in this range. The live AA
-    -- window scan above remains authoritative for custom Triune entries.
-    for id = 1, 2500 do
-        local aa = mq.TLO.AltAbility(id)
-        local name = safeAAValue(aa, 'Name', nil)
-        if name and name ~= '' then recordAA(name) end
-        if id % 250 == 0 then mq.delay(1) end
-    end
-end
-
 local function refreshCatalog()
+    -- Structural prerequisite metadata is cached only for this catalog
+    -- generation. A refresh invalidates the cache; nothing is persisted.
+    state.catalogGeneration = (tonumber(state.catalogGeneration) or 0) + 1
+    state.prerequisiteCache = {}
+    state.prerequisiteRuntimeStatus = {}
     state.catalog = {}
     state.catalogByName = {}
-    setStatus('Scanning the current character\'s AA catalog...', 'info')
+    setStatus('Scanning the current character\'s AA window...', 'info')
     scanAAWindow()
-    scanAADatabase()
-    for _, entry in ipairs(state.plan) do recordAA(entry.name, entry.tab) end
     table.sort(state.catalog, function(a, b)
         if a.tab ~= b.tab then return a.tab < b.tab end
         return a.name:lower() < b.name:lower()
     end)
-    setStatus(string.format('Found %d AAs. AA window: %s; %d list rows inspected.',
-            #state.catalog, state.scanStats.window or 'none', state.scanStats.rows or 0),
-        #state.catalog > 0 and 'good' or 'warn')
+
+    local tabAAs = state.scanStats.tabAAs or {}
+    local errorCount = #(state.scanStats.tabErrors or {})
+    local message = string.format(
+        'Found %d AAs from the AA window: General %d, Archetype %d, Class %d.',
+        #state.catalog, tonumber(tabAAs[1] or 0), tonumber(tabAAs[2] or 0), tonumber(tabAAs[3] or 0))
+
+    if errorCount > 0 then
+        message = message .. string.format(' %d tab scan error%s; run /aaplanner debug.',
+            errorCount, errorCount == 1 and '' or 's')
+    end
+
+    setStatus(message, (#state.catalog > 0 and errorCount == 0) and 'good' or 'warn')
 end
 
 local function planContains(name)
@@ -658,15 +1404,66 @@ local function appendSupportLog(line)
     return true
 end
 
-local function writePrioritySnapshot(reason)
+
+
+local function writePrioritySnapshot(reason, force)
+    if not VERBOSE_DEBUG and force ~= true then return false end
     recalculatePlannerStats()
 
     appendSupportLog(string.format(
-        '[PTAAPlanner] Priority snapshot (%s) Version=%s Entries=%d AAPoints=%d QueueCost=%d QueueCostComplete=%s AutoSpend=%s ConsumeExperience=%s ConsumeThreshold=%d',
+        '[PTAAPlanner] Priority snapshot (%s) Version=%s Entries=%d AAPoints=%d QueueCost=%d QueueCostComplete=%s AutoSpend=%s',
         tostring(reason or 'update'), VERSION, #state.plan, tonumber(state.aaPoints or 0),
         tonumber(state.queueCost or 0), tostring(state.queueCostComplete),
-        tostring(state.autoSpendEnabled), tostring(state.consumeExperience),
-        tonumber(state.consumeExperienceThreshold or 100)))
+        tostring(state.autoSpendEnabled)))
+
+    local prereqCacheCount = 0
+    for _ in pairs(state.prerequisiteCache or {}) do
+        prereqCacheCount = prereqCacheCount + 1
+    end
+    appendSupportLog(string.format(
+        '[PTAAPlanner] PREREQ DEBUG | SkipEnabled=%s CatalogGeneration=%d CacheEntries=%d',
+        tostring(state.skipUnmetPrerequisites == true),
+        tonumber(state.catalogGeneration or 0),
+        prereqCacheCount))
+
+    -- Run the same queue evaluator used by the spender/UI so the debug log
+    -- shows exactly which entries are being skipped and which AA is the
+    -- effective next purchase candidate.
+    local candidate, candidateRank, candidateMaxRank, candidateCost, candidateError, queueState = evaluateQueue()
+
+    for i, entry in ipairs(state.plan) do
+        local runtime = state.prerequisiteRuntimeStatus[tostring(entry.name or ''):lower()]
+        if runtime then
+            local info = runtime.info or {}
+            appendSupportLog(string.format(
+                '[PTAAPlanner] PREREQ #%d %s | State=%s | Requires=%s | RequiredRank=%s | CurrentRank=%s | Action=%s%s',
+                i,
+                tostring(entry.name),
+                tostring(runtime.state or 'unknown'),
+                tostring(info.requiredName or 'none'),
+                tostring(info.requiredRank or 0),
+                tostring(info.currentRank ~= nil and info.currentRank or 'n/a'),
+                runtime.state == 'unmet' and 'SKIP' or 'KEEP',
+                info.reason and (' | Reason=' .. tostring(info.reason)) or ''))
+        end
+    end
+
+    if candidate then
+        appendSupportLog(string.format(
+            '[PTAAPlanner] QUEUE CANDIDATE %s | Rank=%d/%d | Target=%d | Cost=%d | SkippedBefore=%d%s',
+            tostring(candidate.name),
+            tonumber(candidateRank or 0),
+            tonumber(candidateMaxRank or 0),
+            tonumber(getEntryTarget(candidate, candidateMaxRank) or 0),
+            tonumber(candidateCost or 0),
+            tonumber(queueState and queueState.skippedCount or 0),
+            candidateError and (' | Error=' .. tostring(candidateError)) or ''))
+    else
+        appendSupportLog(string.format(
+            '[PTAAPlanner] QUEUE RESULT %s | Skipped=%d',
+            tostring(queueState and queueState.state or 'unknown'),
+            tonumber(queueState and queueState.skippedCount or 0)))
+    end
 
     if #state.plan == 0 then
         appendSupportLog('[PTAAPlanner] Priority list is empty.')
@@ -674,22 +1471,26 @@ local function writePrioritySnapshot(reason)
     end
 
     for i, entry in ipairs(state.plan) do
-        local currentRank, maxRank, nextCost = getAAProgress(entry.name)
+        local currentRank, maxRank, nextCost, costSource = getAAProgress(entry.name)
         local target = getEntryTarget(entry, maxRank)
         local remainingCost, resolved = remainingCostForEntry(entry)
+        local cached = state.catalogByName[tostring(entry.name or ''):lower()]
         appendSupportLog(string.format(
-            '[PTAAPlanner] #%d %s | Target=%s | Current=%d/%d | NextCost=%d | RemainingCost=%d | CostResolved=%s',
+            '[PTAAPlanner] #%d %s | Target=%s | Current=%d/%d | NextCost=%d | CostSource=%s | RemainingCost=%d | CostResolved=%s',
             i, tostring(entry.name), tostring(entry.rank), tonumber(currentRank or 0),
-            tonumber(maxRank or 0), tonumber(nextCost or 0), tonumber(remainingCost or 0),
-            tostring(resolved)))
+            tonumber(maxRank or 0), tonumber(nextCost or 0), tostring(costSource or 'Unresolved'),
+            tonumber(remainingCost or 0), tostring(resolved)))
 
         if not resolved then
             appendSupportLog(string.format(
-                '[PTAAPlanner] COST DEBUG %s | Group=%d | Future rank costs unavailable until each preceding rank is purchased',
+                '[PTAAPlanner] COST DEBUG %s | Group=%d | WindowRank=%s | WindowCost=%s | Future rank costs unavailable until each preceding rank is purchased',
                 tostring(entry.name),
-                tonumber(safeAAValue(mq.TLO.AltAbility(entry.name), 'GroupID', 0)) or 0))
+                tonumber(safeAAValue(mq.TLO.AltAbility(entry.name), 'GroupID', 0)) or 0,
+                cached and tostring(cached.windowRank) or 'nil',
+                cached and tostring(cached.windowCost) or 'nil'))
         end
     end
+    return true
 end
 
 local function normalizeAAName(value)
@@ -813,6 +1614,86 @@ local function findAAWindowRow(targetName, preferredTab)
     return nil
 end
 
+local function readAAWindowRowData(control, row)
+    if not control or not control() or not row then return nil end
+
+    local title, rankText, costText
+    pcall(function() title = trim(control.List(row, 1)()) end)
+    pcall(function() rankText = trim(control.List(row, 2)()) end)
+    pcall(function() costText = trim(control.List(row, 3)()) end)
+
+    if not title or title == '' or title == 'NULL' then
+        pcall(function() title = trim(control.List(row)()) end)
+    end
+
+    local currentRank, maxRank
+    if rankText and rankText ~= '' then
+        local currentText, maxText = rankText:match('^%s*(%d+)%s*/%s*(%d+)%s*$')
+        currentRank = tonumber(currentText)
+        maxRank = tonumber(maxText)
+    end
+
+    return {
+        title = title,
+        currentRank = currentRank,
+        maxRank = maxRank,
+        cost = tonumber(costText or '') or 0,
+    }
+end
+
+local function purchaseSnapshotStillCurrent(task)
+    if not task or task.kind ~= 'aa' then return true end
+
+    if (tonumber(state.planGeneration) or 0) ~= (tonumber(task.planGeneration) or -1) then
+        return false, 'queue generation changed'
+    end
+
+    -- IMPORTANT: with prerequisite skipping enabled, the effective purchase
+    -- candidate may not be state.plan[1]. Re-evaluate the queue using the
+    -- same logic as the UI/spender and compare against that effective
+    -- candidate instead of the literal first list entry.
+    local effectiveEntry, effectiveRank, effectiveMaxRank, _, effectiveError, queueState = evaluateQueue()
+    if not effectiveEntry then
+        local queueStateName = queueState and queueState.state or 'unknown'
+        return false, 'effective priority candidate unavailable (' .. tostring(queueStateName) .. ')'
+    end
+
+    if normalizeAAName(effectiveEntry.name) ~= normalizeAAName(task.name) then
+        return false, string.format(
+            'effective priority candidate changed (%s -> %s)',
+            tostring(task.name), tostring(effectiveEntry.name))
+    end
+
+    if tostring(effectiveEntry.rank or '') ~= tostring(task.targetSpec or '') then
+        return false, 'target rank changed'
+    end
+
+    if effectiveError then
+        return false, 'effective priority candidate unresolved: ' .. tostring(effectiveError)
+    end
+
+    return true
+end
+
+local function abortPurchaseForQueueChange(task, reason, now)
+    if task and task.openedByUs then closeAAWindow() end
+    local effectiveEntry, effectiveRank, effectiveMaxRank, effectiveCost, effectiveError, queueState = evaluateQueue()
+    appendSupportLog(string.format(
+        '[PTAAPlanner] PURCHASE ABORTED %s | reason=%s | startGeneration=%s currentGeneration=%s | effectiveCandidate=%s | effectiveRank=%s/%s | effectiveCost=%s | queueState=%s%s',
+        task and tostring(task.name) or '<unknown>', tostring(reason or 'queue changed'),
+        task and tostring(task.planGeneration) or 'nil', tostring(state.planGeneration),
+        effectiveEntry and tostring(effectiveEntry.name) or 'none',
+        effectiveRank ~= nil and tostring(effectiveRank) or 'n/a',
+        effectiveMaxRank ~= nil and tostring(effectiveMaxRank) or 'n/a',
+        effectiveCost ~= nil and tostring(effectiveCost) or 'n/a',
+        queueState and tostring(queueState.state) or 'unknown',
+        effectiveError and (' | effectiveError=' .. tostring(effectiveError)) or ''))
+    state.pendingPurchase = nil
+    state.manualSpendQueued = false
+    state.nextSpendAt = (now or monotonicSeconds()) + 0.10
+    setStatus('Purchase attempt cancelled because the priority list changed. The next pass will use the updated queue.', 'info', 4)
+end
+
 local function getSelectedListRow(control)
     if not control or not control() then return nil end
     for _, member in ipairs({ 'CurSel', 'CurrentSelection', 'SelectedIndex' }) do
@@ -904,13 +1785,9 @@ local function aaCanTrain(name)
 end
 
 local function nextIncompleteEntry()
-    for _, entry in ipairs(state.plan) do
-        local rank, maxRank, cost = getAAProgress(entry.name)
-        local target = getEntryTarget(entry, maxRank)
-        if target <= 0 then return entry, rank, maxRank, cost, 'target rank could not be resolved' end
-        if rank < target then return entry, rank, maxRank, cost end
-    end
-    return nil
+    -- Both the spender and the UI use evaluateQueue(), so "Next Purchase"
+    -- always matches the AA the native spender will actually consider.
+    return evaluateQueue()
 end
 
 local function stopAutoSpend(message, kind)
@@ -927,22 +1804,16 @@ local function startNativePurchase(entry, rank, cost, manual)
         rankBefore = tonumber(rank) or 0, pointsBefore = getCurrentAAPoints(),
         cost = tonumber(cost) or 0, step = 'open', retries = 0,
         openedByUs = false, manual = manual == true,
+        planGeneration = tonumber(state.planGeneration) or 0,
+        targetSpec = tostring(entry.rank or ''),
         startedAt = monotonicSeconds(), nextStepAt = monotonicSeconds(),
     }
     setStatus(string.format('Purchasing %s rank %d for %d AA...', entry.name, rank + 1, cost), 'info')
 end
 
-local function startConsumeExperience(manual)
-    local points = getCurrentAAPoints()
-    state.pendingPurchase = {
-        kind = 'consume', name = 'Consume Experience', pointsBefore = points,
-        step = 'activate', manual = manual == true, startedAt = monotonicSeconds(), nextStepAt = monotonicSeconds(),
-    }
-    setStatus(string.format('Activating Consume Experience with %d AA points...', points), 'info')
-end
-
 local function requestSpendPass(manual)
     if state.pendingPurchase then return false end
+
     local busy = playerBusyReason()
     if busy then
         if manual then
@@ -955,7 +1826,7 @@ local function requestSpendPass(manual)
 
     pruneCompletedPlan()
     recalculatePlannerStats()
-    local entry, rank, maxRank, cost, resolveError = nextIncompleteEntry()
+    local entry, rank, maxRank, cost, resolveError, queueState = nextIncompleteEntry()
     if entry then
         if resolveError then
             if manual then setStatus(string.format('Cannot purchase %s: %s. Refresh the AA catalog and verify its target rank.', entry.name, resolveError), 'error') end
@@ -975,37 +1846,45 @@ local function requestSpendPass(manual)
             return false
         end
         if not aaCanTrain(entry.name) then
-            stopAutoSpend(string.format('Cannot purchase %s rank %d: prerequisites or level requirements are not met. Auto Spend has been disabled.',
-                entry.name, rank + 1), 'error')
-            appendSupportLog(string.format('[PTAAPlanner] BLOCKED %s rank %d: CanTrain=false, AAPoints=%d, Cost=%d, MaxRank=%d',
-                entry.name, rank + 1, state.aaPoints, cost, maxRank))
-            return false
+            appendSupportLog(string.format(
+                '[PTAAPlanner] PRECHECK %s rank %d | CanTrain=false | AAPoints=%d | CachedCost=%d | proceeding to AA-window verification',
+                entry.name, rank + 1, state.aaPoints, cost))
         end
         startNativePurchase(entry, rank, cost, manual)
         return true
     end
 
-    local threshold = math.max(1, math.floor(tonumber(state.consumeExperienceThreshold) or 100))
-    if state.consumeExperience and state.aaPoints >= threshold then
-        startConsumeExperience(manual)
-        return true
+    -- A queue containing only temporarily skipped entries is NOT complete.
+    -- Keep waiting for those prerequisites instead of treating the queue as done.
+    if queueState and queueState.state == 'all_blocked' then
+        if manual then
+            setStatus(string.format(
+                'No queued AA can be purchased yet: %d entr%s currently blocked by unmet prerequisites.',
+                tonumber(queueState.skippedCount or 0),
+                tonumber(queueState.skippedCount or 0) == 1 and 'y is' or 'ies are'), 'warn')
+        end
+        return false
+    end
+
+    if manual then
+        setStatus('The priority list is complete.', 'info')
     end
     return false
 end
 
 local function finishPurchaseSuccess(task, rankAfter, pointsAfter)
-    if task.kind == 'aa' then
-        setStatus(string.format('Purchased %s rank %d. %d AA points remain.', task.name, rankAfter, pointsAfter), 'good', 6)
-        appendSupportLog(string.format('[PTAAPlanner] PURCHASED %s rank %d; points %d -> %d',
-            task.name, rankAfter, task.pointsBefore, pointsAfter))
-        pruneCompletedPlan()
-    else
-        setStatus(string.format('Consume Experience activated. AA points changed from %d to %d.', task.pointsBefore, pointsAfter), 'good', 6)
-        appendSupportLog(string.format('[PTAAPlanner] CONSUME EXPERIENCE points %d -> %d', task.pointsBefore, pointsAfter))
-    end
+    setStatus(string.format('Purchased %s rank %d. %d AA points remain.', task.name, rankAfter, pointsAfter), 'good', 6)
+    appendSupportLog(string.format('[PTAAPlanner] PURCHASED %s rank %d; points %d -> %d',
+        task.name, rankAfter, task.pointsBefore, pointsAfter))
+    pruneCompletedPlan()
     state.pendingPurchase = nil
     state.nextSpendAt = monotonicSeconds() + 0.75
     recalculatePlannerStats()
+end
+
+local function purchaseIsCommitted(task)
+    if not task or task.kind ~= 'aa' then return false end
+    return task.step == 'wait_confirmation' or task.step == 'verify'
 end
 
 local function processNativePurchase()
@@ -1014,33 +1893,30 @@ local function processNativePurchase()
     local now = monotonicSeconds()
     if now < (task.nextStepAt or 0) then return end
 
-    local busy = playerBusyReason()
-    if busy then
-        if task.openedByUs then closeAAWindow() end
-        if task.manual then state.manualSpendQueued = true end
-        state.pendingPurchase = nil
-        state.nextSpendAt = now + 2
-        return
-    end
-
-    if task.kind == 'consume' then
-        if task.step == 'activate' then
-            mq.cmd('/alt activate 17789')
-            task.step = 'verify'
-            task.nextStepAt = now + 0.5
+    -- Busy-state safety can cancel/retry only before the Train click.
+    -- Once committed, the remaining states are observation-only and must
+    -- survive combat/casting/navigation changes until success/timeout resolves.
+    if not purchaseIsCommitted(task) then
+        local busy = playerBusyReason()
+        if busy then
+            if task.openedByUs then closeAAWindow() end
+            if task.manual then state.manualSpendQueued = true end
+            state.pendingPurchase = nil
+            state.nextSpendAt = now + 2
             return
         end
-        local pointsAfter = getCurrentAAPoints()
-        if pointsAfter < task.pointsBefore then
-            finishPurchaseSuccess(task, 0, pointsAfter)
-        elseif now - task.startedAt > 6 then
-            state.pendingPurchase = nil
-            state.nextSpendAt = now + 30
-            setStatus('Consume Experience did not activate. Verify the ability is available and a valid item is equipped in the power source slot.', 'error')
-        else
-            task.nextStepAt = now + 0.25
+    end
+
+
+    -- Queue edits may invalidate any pre-commit step. After Train is clicked,
+    -- finish observing the committed purchase first; the updated queue applies
+    -- to the next spend pass.
+    if not purchaseIsCommitted(task) then
+        local snapshotOK, snapshotReason = purchaseSnapshotStillCurrent(task)
+        if not snapshotOK then
+            abortPurchaseForQueueChange(task, snapshotReason, now)
+            return
         end
-        return
     end
 
     if task.step == 'open' then
@@ -1097,12 +1973,73 @@ local function processNativePurchase()
         task.step = 'verify_row'
         task.nextStepAt = now + 0.25
     elseif task.step == 'verify_row' then
-        local controlName, row, foundTab = findAAWindowRow(task.name, task.tab)
+        local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab)
         if not controlName or foundTab ~= task.tab or row ~= task.selectedRow then
             if task.openedByUs then closeAAWindow() end
             stopAutoSpend('The selected AA row changed before training. No purchase was attempted; Auto Spend has been disabled.', 'error')
             return
         end
+
+        local rowData = readAAWindowRowData(control, row)
+        if not rowData or normalizeAAName(rowData.title) ~= normalizeAAName(task.name) then
+            if task.openedByUs then closeAAWindow() end
+            state.pendingPurchase = nil
+            state.nextSpendAt = now + 2
+            setStatus('Could not verify the selected AA row data. No purchase was attempted; the planner will retry.', 'warn')
+            appendSupportLog(string.format('[PTAAPlanner] WINDOW VERIFY FAILED %s | row data unavailable or title mismatch', task.name))
+            return
+        end
+
+        if rowData.currentRank == nil or rowData.currentRank ~= task.rankBefore then
+            if task.openedByUs then closeAAWindow() end
+            state.pendingPurchase = nil
+            state.nextSpendAt = now + 0.25
+            appendSupportLog(string.format(
+                '[PTAAPlanner] WINDOW RANK CHANGED %s | expected=%d window=%s | restarting purchase decision',
+                task.name, task.rankBefore, tostring(rowData.currentRank)))
+            setStatus('AA rank changed while preparing the purchase. Re-evaluating the priority list.', 'info', 4)
+            return
+        end
+
+        if rowData.cost <= 0 then
+            if task.openedByUs then closeAAWindow() end
+            state.pendingPurchase = nil
+            state.nextSpendAt = now + 2
+            appendSupportLog(string.format(
+                '[PTAAPlanner] WINDOW COST UNRESOLVED %s | rank=%d cachedCost=%d',
+                task.name, task.rankBefore, tonumber(task.cost or 0)))
+            setStatus('The AA window did not expose a valid next-rank cost for ' .. task.name .. '. Retrying shortly.', 'warn')
+            return
+        end
+
+        local cached = state.catalogByName[tostring(task.name or ''):lower()]
+        if cached then
+            cached.windowRank = rowData.currentRank
+            cached.windowCost = rowData.cost
+            if rowData.maxRank and rowData.maxRank > 0 then cached.maxRank = rowData.maxRank end
+        end
+
+        if tonumber(task.cost or 0) ~= rowData.cost then
+            appendSupportLog(string.format(
+                '[PTAAPlanner] COST MISMATCH %s | rank=%d planner=%d window=%d | using AA window',
+                task.name, task.rankBefore, tonumber(task.cost or 0), rowData.cost))
+            task.cost = rowData.cost
+            recalculatePlannerStats()
+        end
+
+        local currentPoints = getCurrentAAPoints()
+        if currentPoints < rowData.cost then
+            if task.openedByUs then closeAAWindow() end
+            state.pendingPurchase = nil
+            state.nextSpendAt = now + 0.50
+            appendSupportLog(string.format(
+                '[PTAAPlanner] WAITING %s rank %d | AAPoints=%d WindowCost=%d',
+                task.name, task.rankBefore + 1, currentPoints, rowData.cost))
+            setStatus(string.format('Waiting for %s rank %d: have %d AA, need %d.',
+                task.name, task.rankBefore + 1, currentPoints, rowData.cost), 'info', 4)
+            return
+        end
+
         local _, windowName = getAAWindow()
         windowName = windowName or 'AAWindow'
         -- Reassert the exact verified row immediately before enabling the Train
@@ -1125,6 +2062,12 @@ local function processNativePurchase()
         task.step = 'click_train'
         task.nextStepAt = now + 0.05
     elseif task.step == 'click_train' then
+        local finalSnapshotOK, finalSnapshotReason = purchaseSnapshotStillCurrent(task)
+        if not finalSnapshotOK then
+            abortPurchaseForQueueChange(task, finalSnapshotReason, now)
+            return
+        end
+
         local existingDialog = getConfirmationDialog()
         if existingDialog then
             stopAutoSpend('A confirmation dialog was already open before the AA purchase. It was left untouched; close it and try again.', 'error')
@@ -1196,11 +2139,38 @@ local function processNativePurchase()
             if task.openedByUs then closeAAWindow() end
             finishPurchaseSuccess(task, rankAfter, pointsAfter)
         elseif now - (task.clickedAt or task.startedAt) > 6 then
+            local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab)
+            local rowData = controlName and foundTab == task.tab and readAAWindowRowData(control, row) or nil
+            local windowRank = rowData and rowData.currentRank or nil
+            local windowCost = rowData and tonumber(rowData.cost or 0) or 0
+
+            if rowData and windowRank == task.rankBefore and windowCost > 0 and windowCost ~= tonumber(task.cost or 0) then
+                appendSupportLog(string.format(
+                    '[PTAAPlanner] PURCHASE FAILURE COST MISMATCH %s | rank=%d attemptedCost=%d windowCost=%d | retrying with window cost',
+                    task.name, task.rankBefore, tonumber(task.cost or 0), windowCost))
+                local cached = state.catalogByName[tostring(task.name or ''):lower()]
+                if cached then
+                    cached.windowRank = windowRank
+                    cached.windowCost = windowCost
+                end
+                if task.openedByUs then closeAAWindow() end
+                state.pendingPurchase = nil
+                state.nextSpendAt = now + 0.25
+                recalculatePlannerStats()
+                setStatus(string.format('The AA window reports %d AA for %s. Updated the cost and will retry.',
+                    windowCost, task.name), 'warn', 6)
+                return
+            end
+
+            local canTrain = aaCanTrain(task.name)
             if task.openedByUs then closeAAWindow() end
-            stopAutoSpend(string.format('Purchase of %s rank %d was not confirmed. Check its prerequisites and level requirements, then re-enable Auto Spend.',
+            stopAutoSpend(string.format(
+                'Purchase of %s rank %d was not confirmed after verifying the AA window. Auto Spend has been disabled for review.',
                 task.name, task.rankBefore + 1), 'error')
-            appendSupportLog(string.format('[PTAAPlanner] PURCHASE TIMEOUT %s rank %d; points remained %d',
-                task.name, task.rankBefore + 1, pointsAfter))
+            appendSupportLog(string.format(
+                '[PTAAPlanner] PURCHASE TIMEOUT %s rank %d | points=%d | WindowRank=%s | WindowCost=%s | AttemptedCost=%d | CanTrain=%s',
+                task.name, task.rankBefore + 1, pointsAfter,
+                tostring(windowRank), tostring(windowCost), tonumber(task.cost or 0), tostring(canTrain)))
         else
             task.nextStepAt = now + 0.25
         end
@@ -1208,8 +2178,8 @@ local function processNativePurchase()
 end
 
 local function enableAutoSpend()
-    if #state.plan == 0 and not state.consumeExperience then
-        setStatus('The priority list is empty and Consume Experience is disabled.', 'warn')
+    if #state.plan == 0 then
+        setStatus('The priority list is empty.', 'warn')
         return
     end
     state.autoSpendEnabled = true
@@ -1224,27 +2194,6 @@ local function sortedSavedNames()
     for name in pairs(state.savedLists) do names[#names + 1] = name end
     table.sort(names, function(a, b) return a:lower() < b:lower() end)
     return names
-end
-
-local function drawClassSelectors()
-    ImGui.Text('Classes:')
-    for slot = 1, 3 do
-        if slot > 1 then ImGui.SameLine() end
-        ImGui.SetNextItemWidth(125)
-        local currentIndex = 1
-        for i, cls in ipairs(CLASS_ABBR) do if cls == state.classes[slot] then currentIndex = i break end end
-        local newIndex = ImGui.Combo('##class' .. slot, currentIndex, CLASS_ABBR)
-        if newIndex ~= currentIndex then
-            state.classes[slot] = CLASS_ABBR[newIndex]
-            state.classDetected = false
-            markDirty()
-        end
-    end
-    ImGui.SameLine()
-    if ImGui.Button('Re-detect') then state.detectRequested = true end
-    ImGui.SameLine()
-    if state.classDetected then ImGui.TextColored(0.35, 0.9, 0.55, 1, 'Detected')
-    else ImGui.TextColored(1, 0.72, 0.3, 1, 'Manual') end
 end
 
 local function drawCatalogTab(tab)
@@ -1301,7 +2250,18 @@ local function drawPriorityList()
     ImGui.Text(string.format('Additional AA Needed: %d', needed))
     ImGui.TextDisabled(state.autoSpendEnabled and 'Native Auto Spend: enabled' or 'Native Auto Spend: disabled')
 
-    local nextCost, nextName, nextRank, nextTarget = getTopPriorityCost()
+    local skipBlocked = ImGui.Checkbox('Skip AAs with unmet prerequisites', state.skipUnmetPrerequisites)
+    if skipBlocked ~= state.skipUnmetPrerequisites then
+        state.skipUnmetPrerequisites = skipBlocked
+        state.prerequisiteRuntimeStatus = {}
+        markDirty()
+    end
+    if ImGui.IsItemHovered() then
+        ImGui.SetTooltip('%s',
+            'Only confirmed unmet AA prerequisites are skipped. The AA stays in its original queue position and is re-evaluated every pass.')
+    end
+
+    local nextCost, nextName, nextRank, nextTarget, _, nextQueueState = getTopPriorityCost()
     if nextName then
         local rankFrom = tonumber(nextRank or 0)
         local rankTo = rankFrom + 1
@@ -1317,30 +2277,17 @@ local function drawPriorityList()
             ImGui.TextDisabled('Cost: unresolved')
         end
     else
-        ImGui.TextDisabled('Next Purchase: none')
-        ImGui.TextDisabled('Cost: 0 AA')
+        if nextQueueState and nextQueueState.state == 'all_blocked' then
+            ImGui.TextDisabled('Next Purchase: none — waiting on prerequisites')
+            ImGui.TextDisabled(string.format('%d queued AA%s currently skipped.',
+                tonumber(nextQueueState.skippedCount or 0),
+                tonumber(nextQueueState.skippedCount or 0) == 1 and ' is' or 's are'))
+        else
+            ImGui.TextDisabled('Next Purchase: none')
+            ImGui.TextDisabled('Cost: 0 AA')
+        end
     end
 
-	local consumeEnabled = ImGui.Checkbox('Use Consume Experience after priority list', state.consumeExperience)
-	if consumeEnabled ~= state.consumeExperience then
-		state.consumeExperience = consumeEnabled
-		markPlanDirty()
-	end
-	if ImGui.IsItemHovered() then
-		ImGui.SetTooltip('%s', 'When the priority list is empty or complete, activate Consume Experience at the selected AA threshold.')
-	end
-
-	ImGui.SetNextItemWidth(95)
-	local consumeThreshold = ImGui.InputInt('Consume trigger##consumeThreshold',
-		math.max(1, math.floor(tonumber(state.consumeExperienceThreshold) or 100)), 1, 10)
-	consumeThreshold = math.max(1, math.floor(tonumber(consumeThreshold) or 100))
-	if consumeThreshold ~= state.consumeExperienceThreshold then
-		state.consumeExperienceThreshold = consumeThreshold
-		markPlanDirty()
-	end
-	if ImGui.IsItemHovered() then
-		ImGui.SetTooltip('%s', 'Number of unspent AA points required before Consume Experience activates.')
-	end
 
     if ImGui.CollapsingHeader('Auto Spend Safety Checks') then
         ImGui.TextDisabled('Purchases are skipped/retried while any checked condition is true.')
@@ -1389,6 +2336,19 @@ local function drawPriorityList()
             ImGui.SameLine()
             local tabLabel = TAB_NAMES[entry.tab] or 'Unknown'
             ImGui.Text(string.format('%s  [%s]', entry.name, tabLabel))
+
+            local prereqRuntime = state.prerequisiteRuntimeStatus[entry.name:lower()]
+            if state.skipUnmetPrerequisites and prereqRuntime and prereqRuntime.state == 'unmet' then
+                local info = prereqRuntime.info or {}
+                ImGui.SameLine()
+                ImGui.TextDisabled('Skipping — prerequisite not met')
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('%s', string.format('Requires %s rank %d; current rank %d.',
+                        tostring(info.requiredName or 'unknown prerequisite'),
+                        tonumber(info.requiredRank or 0),
+                        tonumber(info.currentRank or 0)))
+                end
+            end
             ImGui.PopID()
         end
     end
@@ -1422,12 +2382,15 @@ local function drawSaveControls()
     ImGui.SameLine()
     if ImGui.Button('Save Current') then
         local name = trim(state.saveName)
-        if name == '' then setStatus('Enter a name before saving.', 'warn')
+        if name == '' then
+            setStatus('Enter a name before saving.', 'warn')
+        elseif state.pendingListSave or state.pendingListDelete then
+            setStatus('Another named-list update is already pending.', 'warn')
         else
-            state.savedLists[name] = copyPlan(state.plan)
-            state.selectedSaved = name
-            writeSavedData()
-            setStatus('Saved list: ' .. name, 'good')
+            -- Do not perform blocking persistence work from the ImGui callback.
+            -- Capture a snapshot and let the top-level loop perform the mutation.
+            state.pendingListSave = { name = name, plan = copyPlan(state.plan) }
+            setStatus('Saving named list: ' .. name .. '...', 'info')
         end
     end
 
@@ -1448,10 +2411,14 @@ local function drawSaveControls()
         end
         ImGui.SameLine()
         if ImGui.Button('Delete Saved') then
-            state.savedLists[state.selectedSaved] = nil
-            state.selectedSaved = ''
-            writeSavedData()
-            setStatus('Deleted the saved list.', 'info')
+            local deleting = state.selectedSaved
+            if state.pendingListSave or state.pendingListDelete then
+                setStatus('Another named-list update is already pending.', 'warn')
+            else
+                -- Defer lock acquisition and disk I/O to the top-level loop.
+                state.pendingListDelete = deleting
+                setStatus('Deleting named list: ' .. deleting .. '...', 'info')
+            end
         end
     end
 
@@ -1517,7 +2484,7 @@ local function drawCompactWindow()
 
     open, visible = ImGui.Begin(APP_NAME .. ' v' .. VERSION .. ' - Compact', open)
     if visible then
-        local nextCost, nextName, nextRank, target = getTopPriorityCost()
+        local nextCost, nextName, nextRank, target, _, nextQueueState = getTopPriorityCost()
 
         ImGui.Text(string.format('Unspent AA Points: %d', state.aaPoints or 0))
 
@@ -1542,15 +2509,15 @@ local function drawCompactWindow()
 
         else
             ImGui.Separator()
-            ImGui.TextDisabled('Priority list complete.')
+            if nextQueueState and nextQueueState.state == 'all_blocked' then
+                ImGui.TextDisabled('Next Purchase: none')
+                ImGui.TextDisabled(string.format('Waiting on prerequisites (%d skipped)',
+                    tonumber(nextQueueState.skippedCount or 0)))
+            else
+                ImGui.TextDisabled('Priority list complete.')
+            end
         end
 
-		if state.consumeExperience then
-			ImGui.Text(string.format('Consume Experience: On at %d AA',
-				math.max(1, math.floor(tonumber(state.consumeExperienceThreshold) or 100))))
-		else
-			ImGui.TextDisabled('Consume Experience: Off')
-		end
 
         ImGui.Separator()
         if ImGui.Button('Full Mode', 110, 28) then
@@ -1590,7 +2557,11 @@ local function drawMainWindow()
     if visible then
         if ImGui.BeginMenuBar() then
             if ImGui.BeginMenu('File') then
-                if ImGui.MenuItem('Save working list') then writeSavedData(); setStatus('Working list saved.', 'good') end
+                if ImGui.MenuItem('Save working list') then
+                    local ok, err = writeCharacterData()
+                    if ok then setStatus('Working list saved for this character.', 'good')
+                    else setStatus('Could not save working list: ' .. tostring(err), 'error') end
+                end
                 if ImGui.MenuItem('Import / Export') then state.showTransfer = true end
                 if ImGui.MenuItem('Close') then open = false end
                 ImGui.EndMenu()
@@ -1601,8 +2572,6 @@ local function drawMainWindow()
             ImGui.EndMenuBar()
         end
 
-        drawClassSelectors()
-        ImGui.Separator()
         if state.status ~= '' then
             if state.statusKind == 'error' then ImGui.TextColored(1, 0.35, 0.35, 1, state.status)
             elseif state.statusKind == 'warn' then ImGui.TextColored(1, 0.72, 0.3, 1, state.status)
@@ -1646,26 +2615,41 @@ mq.bind('/aaplanner', function(command)
         for _, aa in ipairs(state.catalog) do
             if counts[aa.tab] then counts[aa.tab] = counts[aa.tab] + 1 end
         end
-        print(string.format('\at[AA Planner Debug]\ax Version=%s Classes=%s Detected=%s',
-            VERSION, table.concat(state.classes, '/'), tostring(state.classDetected)))
+        print(string.format('\at[AA Planner Debug]\ax Version=%s VerboseDebug=%s', VERSION, tostring(VERBOSE_DEBUG)))
         print(string.format('\at[AA Planner Debug]\ax General=%d Archetype=%d Class=%d Plan=%d NativeAutoSpend=%s',
             counts[1], counts[2], counts[3], #state.plan, tostring(state.autoSpendEnabled)))
         print(string.format('\at[AA Planner Debug]\ax AAWindow=%s Controls=%d Lists=%d Rows=%d Cells=%d',
             tostring(state.scanStats.window), tonumber(state.scanStats.controls or 0),
             tonumber(state.scanStats.listControls or 0), tonumber(state.scanStats.rows or 0),
             tonumber(state.scanStats.cells or 0)))
+        local tabRows = state.scanStats.tabRows or {}
+        local tabAAs = state.scanStats.tabAAs or {}
+        print(string.format('\at[AA Planner Debug]\ax ScanByTab General=%d rows/%d AAs Archetype=%d rows/%d AAs Class=%d rows/%d AAs',
+            tonumber(tabRows[1] or 0), tonumber(tabAAs[1] or 0),
+            tonumber(tabRows[2] or 0), tonumber(tabAAs[2] or 0),
+            tonumber(tabRows[3] or 0), tonumber(tabAAs[3] or 0)))
+        for i, err in ipairs(state.scanStats.tabErrors or {}) do
+            print(string.format('\ar[AA Planner Debug]\ax TabScanError[%d]=%s', i, tostring(err)))
+        end
         print(string.format('\at[AA Planner Debug]\ax ConfigDir=%s SaveFile=%s',
-            tostring(configDir), tostring(saveFile)))
-		print(string.format('\at[AA Planner Debug]\ax AAPoints=%d QueueCost=%d QueueCostComplete=%s AutoManage=%s ConsumeExperience=%s ConsumeThreshold=%d Pending=%s ManualQueued=%s',
+            tostring(configDir), tostring(resolveCharacterSaveFile() or 'unavailable')))
+        print(string.format('\at[AA Planner Debug]\ax SharedListsFile=%s', tostring(sharedSaveFile)))
+        local prereqCacheCount = 0
+        for _ in pairs(state.prerequisiteCache or {}) do prereqCacheCount = prereqCacheCount + 1 end
+        print(string.format('\at[AA Planner Debug]\ax PrereqSkip=%s CatalogGeneration=%d PrereqCacheEntries=%d',
+            tostring(state.skipUnmetPrerequisites), tonumber(state.catalogGeneration or 0), prereqCacheCount))
+		print(string.format('\at[AA Planner Debug]\ax AAPoints=%d QueueCost=%d QueueCostComplete=%s AutoManage=%s Pending=%s ManualQueued=%s',
 			tonumber(state.aaPoints or 0), tonumber(state.queueCost or 0), tostring(state.queueCostComplete),
-			tostring(state.autoManageActive), tostring(state.consumeExperience),
-            tonumber(state.consumeExperienceThreshold or 100),
+			tostring(state.autoManageActive),
             state.pendingPurchase and tostring(state.pendingPurchase.name) or 'none',
             tostring(state.manualSpendQueued)))
+        print(string.format('\at[AA Planner Debug]\ax PendingListSave=%s PendingListDelete=%s',
+            state.pendingListSave and tostring(state.pendingListSave.name) or 'none',
+            state.pendingListDelete and tostring(state.pendingListDelete) or 'none'))
         print(string.format('\at[AA Planner Debug]\ax SafetyChecks Casting=%s Moving=%s Navigating=%s Combat=%s AutoFire=%s XTargets=%s',
             tostring(state.safetyCheckCasting), tostring(state.safetyCheckMoving), tostring(state.safetyCheckNavigating),
             tostring(state.safetyCheckCombat), tostring(state.safetyCheckAutofire), tostring(state.safetyCheckXTargets)))
-        writePrioritySnapshot('/aaplanner debug')
+        writePrioritySnapshot('/aaplanner debug', true)
         print(string.format('\at[AA Planner Debug]\ax Priority snapshot appended to %s',
             tostring(getDebugLogPath() or 'debug log unavailable')))
     elseif command == 'compact' then
@@ -1680,11 +2664,43 @@ end)
 
 mq.imgui.init('AAPlanner', drawMainWindow)
 
+local function processPendingSharedListMutation()
+    if state.pendingListSave then
+        local request = state.pendingListSave
+        state.pendingListSave = nil
+
+        local ok, err = saveNamedList(request.name, request.plan)
+        if ok then
+            state.selectedSaved = request.name
+            setStatus('Saved list: ' .. request.name, 'good')
+        else
+            setStatus('Could not save named list: ' .. tostring(err), 'error')
+        end
+        return true
+    end
+
+    if state.pendingListDelete then
+        local deleting = state.pendingListDelete
+        state.pendingListDelete = nil
+
+        local ok, err = deleteNamedList(deleting)
+        if ok then
+            if state.selectedSaved == deleting then state.selectedSaved = '' end
+            setStatus('Deleted the saved list.', 'info')
+        else
+            setStatus('Could not update named lists: ' .. tostring(err), 'error')
+        end
+        return true
+    end
+
+    return false
+end
+
 while open do
     clearExpiredStatus()
-    if state.detectRequested then state.detectRequested = false; detectClasses() end
     if state.scanRequested then state.scanRequested = false; refreshCatalog() end
     if state.enableRequested then state.enableRequested = false; enableAutoSpend() end
+    processPendingSharedListMutation()
 
     processNativePurchase()
 
@@ -1693,6 +2709,12 @@ while open do
         state.maintenanceAt = now
         pruneCompletedPlan()
         recalculatePlannerStats()
+
+        local sharedNow = monotonicSeconds()
+        if sharedNow >= (state.sharedListsRefreshAt or 0) then
+            refreshSharedListsFromDisk()
+            state.sharedListsRefreshAt = sharedNow + 2
+        end
 
         if not state.pendingPurchase and monotonicSeconds() >= (state.nextSpendAt or 0) then
             if state.manualSpendQueued then
@@ -1706,11 +2728,13 @@ while open do
     if state.dirty then
         -- Debouncing is unnecessary at this scale; persisting here protects the
         -- working list if EQ or MacroQuest closes unexpectedly.
-        writeSavedData()
+        local ok, err = writeCharacterData()
+        if not ok then setStatus('Could not save character state: ' .. tostring(err), 'error') end
     end
     mq.delay(50)
 end
 
-writeSavedData()
+local finalSaveOK, finalSaveErr = writeCharacterData()
+if not finalSaveOK then print('\ar[AA Planner]\ax Final character-state save failed: ' .. tostring(finalSaveErr)) end
 mq.unbind('/aaplanner')
 print('\at[AA Planner]\ax Stopped.')

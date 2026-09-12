@@ -4,14 +4,14 @@ PTAAPlanner is a Project Triune Alternate Advancement planning and automatic pur
 
 It provides a graphical interface for building prioritized AA purchase lists and includes a native Lua AA spender. No MQ2AASpend plugin is required.
 
+As of v0.2.2, PTAAPlanner also supports optional prerequisite-aware queue skipping while preserving the user's original priority order.
+
 ## Features
 
 PTAAPlanner includes:
 
 * Graphical AA browsing and selection
 * General, Archetype, and Class AA categories
-* Automatic Project Triune class detection
-* Manual class selection fallback
 * Custom purchase priorities
 * Target-rank selection
 * Automatic removal of completed priorities
@@ -23,9 +23,9 @@ PTAAPlanner includes:
 * Fast AA Purchase support
 * Live unspent AA point display
 * Priority-list AA cost estimates
-* Next purchase, next rank, and cost display
-* Optional Consume Experience support
-* Configurable Consume Experience AA threshold
+* Effective next purchase, next rank, and cost display
+* Optional prerequisite-aware queue skipping
+* Automatic restoration of original priority when prerequisites are satisfied
 * Compact and full UI modes
 * Saved AA lists
 * Import/export support
@@ -63,13 +63,7 @@ Start PTAAPlanner:
 /lua run aaplanner
 ```
 
-PTAAPlanner will attempt to detect the three classes used by the currently logged-in Project Triune character.
-
-If detection is incorrect or unavailable, select the classes manually or click:
-
-```text
-Re-detect
-```
+PTAAPlanner builds its AA catalog from the currently logged-in character's in-game Alternate Advancement window.
 
 Refresh the AA catalog if necessary.
 
@@ -95,6 +89,10 @@ No external AA spending plugin is required.
 The Purchase Priority panel determines the order in which PTAAPlanner attempts to purchase AAs.
 
 PTAAPlanner always works from the highest incomplete priority downward.
+
+When **Skip unmet prerequisites** is enabled, an AA may be temporarily bypassed only when PTAAPlanner can positively confirm that one of its explicit AA prerequisites is unmet. The skipped AA remains in its original queue position and automatically regains priority once the prerequisite is satisfied.
+
+Unknown or unresolved prerequisite state is never treated as skippable.
 
 An entry is automatically removed when:
 
@@ -149,16 +147,17 @@ Enable Auto Spend
 
 When enough AA points are available, PTAAPlanner:
 
-1. Finds the highest-priority incomplete AA
-2. Verifies that its next rank is trainable
-3. Opens the in-game Alternate Advancement window if necessary
-4. Selects the correct AA category
-5. Locates the intended AA
-6. Selects and verifies the exact AA row
-7. Activates the Train button
-8. Handles the purchase confirmation if one appears
-9. Verifies the purchase by checking the AA rank and AA point total
-10. Removes completed priorities and continues to the next entry
+1. Evaluates the priority list and determines the effective next purchase
+2. Skips only AAs with positively confirmed unmet AA prerequisites when prerequisite skipping is enabled
+3. Verifies the selected candidate and its next-rank cost
+4. Opens the in-game Alternate Advancement window if necessary
+5. Selects the correct AA category
+6. Locates the intended AA
+7. Selects and verifies the exact AA row
+8. Activates the Train button
+9. Handles the purchase confirmation if one appears
+10. Verifies the purchase by checking the AA rank and AA point total
+11. Removes completed priorities and continues evaluating the queue
 
 If PTAAPlanner cannot safely verify what it is about to purchase, it stops Auto Spend instead of attempting an uncertain purchase.
 
@@ -249,50 +248,29 @@ Use it to cancel the pending request.
 
 ## AA Requirements and Prerequisites
 
-Before attempting a purchase, PTAAPlanner checks whether the next rank can currently be trained.
-
-If the highest-priority AA does not meet its prerequisites or level requirements, PTAAPlanner does **not** skip ahead and spend points on another priority.
-
-Instead, Auto Spend is disabled and the blocked AA is reported.
-
-This preserves the exact purchase priority selected by the user.
-
-After resolving the prerequisite or level requirement, re-enable Auto Spend.
-
-## Consume Experience
-
-PTAAPlanner can optionally use Project Triune's **Consume Experience** ability after the AA priority list is complete.
+PTAAPlanner can optionally skip AAs whose explicit AA prerequisites are confirmed unmet.
 
 Enable:
 
 ```text
-Use Consume Experience after priority list
+Skip unmet prerequisites
 ```
 
-Then configure:
+When enabled:
 
-```text
-Consume trigger
-```
+* PTAAPlanner checks the original priority list in order
+* Only a confirmed unmet AA prerequisite causes an entry to be skipped
+* `CanTrain=false` by itself is **not** treated as proof of an unmet prerequisite
+* Unknown, malformed, or unresolved prerequisite state is **not** skipped
+* The first non-skipped incomplete entry becomes the effective next purchase
+* PTAAPlanner does not reach farther down the list merely because a later AA is cheaper
+* Skipped entries remain in their original queue positions
+* Prerequisites are re-evaluated continuously
+* Once a prerequisite is satisfied, the skipped AA automatically regains its original priority
 
-The trigger specifies the number of unspent AA points required before PTAAPlanner attempts to activate Consume Experience.
+This keeps the planner conservative: it only bypasses an AA when it can positively prove why that AA is blocked.
 
-For example:
-
-```text
-Consume trigger: 100
-```
-
-means Consume Experience will only be activated after:
-
-* The Purchase Priority list is empty or complete
-* At least 100 unspent AA points are available
-
-PTAAPlanner verifies that the AA point total changes after activating Consume Experience.
-
-If activation cannot be confirmed, PTAAPlanner reports the failure rather than repeatedly activating the ability.
-
-The Consume Experience setting and threshold are saved between sessions.
+If prerequisite skipping is disabled, PTAAPlanner follows the list strictly and waits on the highest incomplete priority.
 
 ## Compact Mode
 
@@ -307,7 +285,6 @@ Compact Mode displays:
 * Next rank
 * Target rank
 * Next-rank cost
-* Consume Experience status
 * Remaining priority count
 
 Compact Mode also includes controls to enable or disable Auto Spend.
@@ -377,10 +354,8 @@ Saved data includes:
 
 * Current working priority list
 * Named saved lists
-* Selected class combination
 * Compact Mode preference
-* Consume Experience setting
-* Consume Experience threshold
+* Prerequisite-skipping preference
 * Auto Spend safety-check settings
 
 This helps protect the current configuration if EverQuest or MacroQuest closes unexpectedly.
@@ -398,7 +373,6 @@ PTAAPlanner prints diagnostic information and writes a detailed priority snapsho
 Debug information includes:
 
 * PTAAPlanner version
-* Detected classes
 * AA catalog statistics
 * Current AA points
 * Purchase priorities
@@ -408,7 +382,8 @@ Debug information includes:
 * Native Auto Spend status
 * Pending purchase state
 * Queued manual purchase state
-* Consume Experience settings
+* Prerequisite-evaluation state
+* Effective queue candidate
 * Auto Spend safety-check settings
 
 The debug log is character-specific and uses a filename similar to:
@@ -420,10 +395,10 @@ PTAAPlanner_<Server>_<Character>_debug.log
 Purchase activity and important Auto Spend failures are also logged, including:
 
 * Successful AA purchases
-* Prerequisite or trainability blocks
+* Prerequisite evaluation and skips
+* Trainability blocks
 * Confirmation mismatches
 * Purchase verification timeouts
-* Consume Experience activation
 
 When reporting an AA purchasing issue, please include this log whenever possible.
 
@@ -500,7 +475,8 @@ Beginning with v0.2:
 * MQ2AASpend is no longer required
 * Dynamic MQ2AASpend banking is no longer used
 * PTAAPlanner follows the displayed priority list directly
-* A blocked top priority stops Auto Spend instead of allowing another priority to be purchased
+* Optional prerequisite-aware skipping can temporarily bypass only AAs with confirmed unmet AA prerequisites
+* Queue order itself is never rewritten
 * Purchase selection and confirmation are verified by PTAAPlanner itself
 
 Users may leave MQ2AASpend installed for other purposes, but PTAAPlanner does not require or manage it.
