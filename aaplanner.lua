@@ -2401,6 +2401,41 @@ local function finishPurchaseSuccess(task, rankAfter, pointsAfter)
     recalculatePlannerStats()
 end
 
+local function refreshTaskOccurrenceFromWindow(task)
+    if not task or not task.name then return nil, 'task unavailable' end
+    local controlName, row, foundTab, control =
+        findAAWindowRow(task.name, task.tab, task.occurrence)
+    if not controlName or foundTab ~= task.tab then
+        return nil, 'AA row not found'
+    end
+
+    local rowData = readAAWindowRowData(control, row)
+    if not rowData or normalizeAAName(rowData.title) ~= normalizeAAName(task.name) then
+        return nil, 'AA row data unavailable or title mismatch'
+    end
+
+    local cached = getCatalogAA(task.name, task.tab, task.occurrence)
+    if cached then
+        local oldRank = cached.windowRank
+        local oldCost = cached.windowCost
+        local oldMaxRank = cached.maxRank
+        cached.windowRank = rowData.currentRank
+        cached.windowCost = math.max(0, tonumber(rowData.cost) or 0)
+        if rowData.maxRank and rowData.maxRank > 0 then
+            cached.maxRank = rowData.maxRank
+        end
+        appendSupportLog(string.format(
+            '[PTAAPlanner] PURCHASE CACHE REFRESH %s #%d [%s] | Rank=%s->%s | Cost=%s->%s | MaxRank=%s->%s',
+            task.name, tonumber(task.occurrence) or 1,
+            tostring(TAB_NAMES[task.tab] or task.tab or 'Unknown'),
+            tostring(oldRank), tostring(cached.windowRank),
+            tostring(oldCost), tostring(cached.windowCost),
+            tostring(oldMaxRank), tostring(cached.maxRank)))
+    end
+
+    return rowData, nil
+end
+
 local function purchaseIsCommitted(task)
     if not task or task.kind ~= 'aa' then return false end
     return task.step == 'wait_confirmation' or task.step == 'verify'
@@ -2510,13 +2545,36 @@ local function processNativePurchase()
         end
 
         if rowData.currentRank == nil or rowData.currentRank ~= task.rankBefore then
+            local cached = getCatalogAA(task.name, task.tab, task.occurrence)
+            if rowData.currentRank ~= nil and cached then
+                local oldRank = cached.windowRank
+                local oldCost = cached.windowCost
+                local oldMaxRank = cached.maxRank
+                cached.windowRank = rowData.currentRank
+                cached.windowCost = math.max(0, tonumber(rowData.cost) or 0)
+                if rowData.maxRank and rowData.maxRank > 0 then
+                    cached.maxRank = rowData.maxRank
+                end
+                appendSupportLog(string.format(
+                    '[PTAAPlanner] WINDOW CACHE REFRESH %s #%d [%s] | Rank=%s->%s | Cost=%s->%s | MaxRank=%s->%s',
+                    task.name, tonumber(task.occurrence) or 1,
+                    tostring(TAB_NAMES[task.tab] or task.tab or 'Unknown'),
+                    tostring(oldRank), tostring(cached.windowRank),
+                    tostring(oldCost), tostring(cached.windowCost),
+                    tostring(oldMaxRank), tostring(cached.maxRank)))
+            end
+
             if task.openedByUs then closeAAWindow() end
             state.pendingPurchase = nil
             state.nextSpendAt = now + 0.25
             appendSupportLog(string.format(
-                '[PTAAPlanner] WINDOW RANK CHANGED %s | expected=%d window=%s | restarting purchase decision',
-                task.name, task.rankBefore, tostring(rowData.currentRank)))
+                '[PTAAPlanner] WINDOW RANK CHANGED %s #%d [%s] | expected=%d window=%s | cacheRefreshed=%s | restarting purchase decision',
+                task.name, tonumber(task.occurrence) or 1,
+                tostring(TAB_NAMES[task.tab] or task.tab or 'Unknown'),
+                task.rankBefore, tostring(rowData.currentRank),
+                tostring(rowData.currentRank ~= nil and cached ~= nil)))
             setStatus('AA rank changed while preparing the purchase. Re-evaluating the priority list.', 'info', 4)
+            recalculatePlannerStats()
             return
         end
 
@@ -2617,6 +2675,12 @@ local function processNativePurchase()
         local rankAfter = select(1, getAAProgress(task.name, task.tab, task.occurrence))
         local pointsAfter = getCurrentAAPoints()
         if rankAfter > task.rankBefore or pointsAfter < task.pointsBefore then
+            if rankAfter <= task.rankBefore and pointsAfter < task.pointsBefore then
+                local rowData = refreshTaskOccurrenceFromWindow(task)
+                if rowData and rowData.currentRank ~= nil then
+                    rankAfter = tonumber(rowData.currentRank) or rankAfter
+                end
+            end
             if task.openedByUs then closeAAWindow() end
             finishPurchaseSuccess(task, rankAfter, pointsAfter)
             return
@@ -2655,6 +2719,12 @@ local function processNativePurchase()
         local rankAfter = select(1, getAAProgress(task.name, task.tab, task.occurrence))
         local pointsAfter = getCurrentAAPoints()
         if rankAfter > task.rankBefore or pointsAfter < task.pointsBefore then
+            if rankAfter <= task.rankBefore and pointsAfter < task.pointsBefore then
+                local rowData = refreshTaskOccurrenceFromWindow(task)
+                if rowData and rowData.currentRank ~= nil then
+                    rankAfter = tonumber(rowData.currentRank) or rankAfter
+                end
+            end
             if task.openedByUs then closeAAWindow() end
             finishPurchaseSuccess(task, rankAfter, pointsAfter)
         elseif now - (task.clickedAt or task.startedAt) > 6 then
