@@ -4,14 +4,14 @@ PTAAPlanner is a Project Triune Alternate Advancement planning and automatic pur
 
 It provides a graphical interface for building prioritized AA purchase lists and includes a native Lua AA spender. No MQ2AASpend plugin is required.
 
-As of v0.2.2, PTAAPlanner also supports optional prerequisite-aware queue skipping while preserving the user's original priority order.
+As of v0.2.3, PTAAPlanner uses prerequisite data generated directly from the Project Triune database for prerequisite validation and optional prerequisite-aware queue skipping.
 
 ## Features
 
 PTAAPlanner includes:
 
 * Graphical AA browsing and selection
-* General, Archetype, and Class AA categories
+* General, Archetype, Class, and Special AA categories
 * Custom purchase priorities
 * Target-rank selection
 * Automatic removal of completed priorities
@@ -24,8 +24,10 @@ PTAAPlanner includes:
 * Live unspent AA point display
 * Priority-list AA cost estimates
 * Effective next purchase, next rank, and cost display
+* Database-backed prerequisite validation when adding AAs
 * Optional prerequisite-aware queue skipping
 * Automatic restoration of original priority when prerequisites are satisfied
+* Distinct handling for duplicate AA names, including same-name entries within the same tab
 * Compact and full UI modes
 * Saved AA lists
 * Import/export support
@@ -36,12 +38,20 @@ PTAAPlanner includes:
 * Project Triune
 * MacroQuest compatible with Project Triune
 * PTAAPlanner
+* `PTAAPrereqData.lua` from the same release
 
 PTAAPlanner v0.2 and later do **not** require MQ2AASpend or PTMQ2AASpend.
 
 ## Installation
 
-Download `aaplanner.lua` from the latest PTAAPlanner release and copy it to:
+Download both release files:
+
+```text
+aaplanner.lua
+PTAAPrereqData.lua
+```
+
+Copy both files to:
 
 ```text
 MacroQuest\lua\
@@ -216,7 +226,7 @@ Available checks include:
 
 When an enabled condition is active, PTAAPlanner temporarily delays the purchase.
 
-These checks are configurable because Project Triune characters are often actively pulling, navigating, fighting, or maintaining XTargets while AA points are earned.
+These checks are the sole pre-purchase activity gate. PTAAPlanner does not pause, resume, or otherwise control Triune AutoCombat. If a condition such as navigation is expected during normal play, simply disable that safety check.
 
 The default settings are intended to avoid conditions that are most likely to interfere with the UI purchase process while allowing normal automated hunting behavior.
 
@@ -248,12 +258,30 @@ Use it to cancel the pending request.
 
 ## AA Requirements and Prerequisites
 
+PTAAPlanner v0.2.3 uses prerequisite relationships generated directly from the Project Triune database.
+
+The in-game AA window remains authoritative for which AAs the current character can see, while the generated prerequisite data is used only for structural AA prerequisite relationships.
+
+PTAAPlanner also tracks duplicate AA names by tab and occurrence, so same-name entries in the same AA tab remain distinct in the catalog, queue, persistence, and purchase-selection paths.
+
+### Add-Time Validation
+
+When you add an AA to the priority list, PTAAPlanner validates its explicit AA prerequisite chain.
+
+If an unmet prerequisite is not already trained or scheduled earlier in the queue at a sufficient target rank, the AA is not added and PTAAPlanner tells you what prerequisite is missing.
+
+PTAAPlanner does not automatically add, reorder, or rewrite prerequisites in v0.2.3.
+
+Unknown or unresolved prerequisite data fails closed during add-time validation rather than allowing an uncertain plan entry.
+
+### Optional Runtime Skipping
+
 PTAAPlanner can optionally skip AAs whose explicit AA prerequisites are confirmed unmet.
 
 Enable:
 
 ```text
-Skip unmet prerequisites
+Skip AAs with unmet prerequisites
 ```
 
 When enabled:
@@ -267,8 +295,6 @@ When enabled:
 * Skipped entries remain in their original queue positions
 * Prerequisites are re-evaluated continuously
 * Once a prerequisite is satisfied, the skipped AA automatically regains its original priority
-
-This keeps the planner conservative: it only bypasses an AA when it can positively prove why that AA is blocked.
 
 If prerequisite skipping is disabled, PTAAPlanner follows the list strictly and waits on the highest incomplete priority.
 
@@ -400,6 +426,8 @@ Purchase activity and important Auto Spend failures are also logged, including:
 * Confirmation mismatches
 * Purchase verification timeouts
 
+Automatic verbose snapshots are disabled in release builds. `/aaplanner debug` still forces a full diagnostic snapshot.
+
 When reporting an AA purchasing issue, please include this log whenever possible.
 
 ## Useful Commands
@@ -414,6 +442,7 @@ When reporting an AA purchasing issue, please include this log whenever possible
 /aaplanner full
 /aaplanner refresh
 /aaplanner debug
+/aaplanner prereqdb <tab> <AA name>
 /aaplanner quit
 ```
 
@@ -437,6 +466,16 @@ Refreshes the current character's AA catalog.
 
 Prints diagnostic information and writes a priority snapshot to the PTAAPlanner debug log.
 
+### `/aaplanner prereqdb <tab> <AA name>`
+
+Support/debug command that prints the authoritative prerequisite lookup for an AA in a specific tab.
+
+Example:
+
+```text
+/aaplanner prereqdb Class Combat Medic
+```
+
 ### `/aaplanner quit`
 
 Stops PTAAPlanner.
@@ -447,8 +486,8 @@ PTAAPlanner is distributed as a Lua script.
 
 To update:
 
-1. Download the latest `aaplanner.lua`
-2. Replace the existing copy in:
+1. Download the latest `aaplanner.lua` and `PTAAPrereqData.lua`
+2. Replace both existing copies in:
 
 ```text
 MacroQuest\lua\
@@ -475,8 +514,11 @@ Beginning with v0.2:
 * MQ2AASpend is no longer required
 * Dynamic MQ2AASpend banking is no longer used
 * PTAAPlanner follows the displayed priority list directly
+* Prerequisite structure is loaded from `PTAAPrereqData.lua`, generated from the Project Triune database
+* Add-time validation rejects AAs whose unmet prerequisite chain is not already satisfied or queued earlier
 * Optional prerequisite-aware skipping can temporarily bypass only AAs with confirmed unmet AA prerequisites
 * Queue order itself is never rewritten
+* Duplicate same-name AAs are preserved as distinct occurrences rather than collapsed by name
 * Purchase selection and confirmation are verified by PTAAPlanner itself
 
 Users may leave MQ2AASpend installed for other purposes, but PTAAPlanner does not require or manage it.

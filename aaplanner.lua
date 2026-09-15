@@ -8,8 +8,24 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local APP_NAME = 'Project Triune AA Planner'
-local VERSION = '0.2.2'
+local VERSION = '0.2.3'
 local open = true
+
+-- Authoritative Project Triune prerequisite data generated from the server database.
+-- Structural prerequisite decisions use this data; live character state remains
+-- authoritative for trained ranks.
+local prereqDB = nil
+local prereqDBLoadError = nil
+do
+    local ok, data = pcall(require, 'PTAAPrereqData')
+    if ok and type(data) == 'table' and tonumber(data.schemaVersion) == 1 then
+        prereqDB = data
+    else
+        prereqDBLoadError = ok
+            and ('PTAAPrereqData returned unsupported data/schema: ' .. tostring(data and data.schemaVersion))
+            or tostring(data)
+    end
+end
 
 -- Build-time diagnostic policy:
 --   Test/internal builds: set VERBOSE_DEBUG = true so automatic snapshots are captured.
@@ -26,14 +42,16 @@ local sharedSaveFile = configDir .. '/aaplanner_lists.lua'
 local sharedLockDir = sharedSaveFile .. '.lock'
 local sharedLockOwnerFile = sharedLockDir .. '/owner.txt'
 local characterSaveFile = nil
-local TAB_NAMES = { [1] = 'General', [2] = 'Archetype', [3] = 'Class' }
-local TAB_IDS = { General = 1, Archetype = 2, Class = 3 }
+local TAB_NAMES = { [1] = 'General', [2] = 'Archetype', [3] = 'Class', [4] = 'Special' }
+local TAB_IDS = { General = 1, Archetype = 2, Class = 3, Special = 4 }
 local state = {
     selectedTab = 1,
     search = '',
     hideMaxed = false,
     catalog = {},
     catalogByName = {},
+    catalogByKey = {},
+    catalogOccurrenceCounts = {},
     catalogGeneration = 0,
     prerequisiteCache = {},
     prerequisiteRuntimeStatus = {},
@@ -52,6 +70,7 @@ local state = {
     enableRequested = false,
     pendingListSave = nil,
     pendingListDelete = nil,
+    pendingAddValidation = nil,
     dirty = false,
     autoManageActive = false,
     autoSpendEnabled = false,
@@ -81,6 +100,39 @@ local state = {
     safetyCheckAutofire = true,
     safetyCheckXTargets = false,
 }
+
+
+
+local function normalizedCatalogName(name)
+    return tostring(name or ''):lower():gsub('^%s+', ''):gsub('%s+$', '')
+end
+
+local function catalogBaseKey(name, tab)
+    return string.format('%d|%s', tonumber(tab) or 0, normalizedCatalogName(name))
+end
+
+local function catalogKey(name, tab, occurrence)
+    return string.format('%s|%d', catalogBaseKey(name, tab), math.max(1, tonumber(occurrence) or 1))
+end
+
+local function getCatalogAA(name, tab, occurrence)
+    name = tostring(name or '')
+    tab = tonumber(tab) or 0
+    if tab > 0 then
+        local exact = state.catalogByKey[catalogKey(name, tab, occurrence)]
+        if exact then return exact end
+    end
+    return state.catalogByName[name:lower()]
+end
+
+local function catalogOccurrenceTotal(name, tab)
+    return tonumber(state.catalogOccurrenceCounts[catalogBaseKey(name, tab)] or 0) or 0
+end
+
+local function entryIdentity(entry)
+    if not entry then return '' end
+    return catalogKey(entry.name, entry.tab, entry.occurrence)
+end
 
 local function trim(value)
     return tostring(value or ''):match('^%s*(.-)%s*$') or ''
@@ -116,7 +168,7 @@ end
 local function copyPlan(plan)
     local result = {}
     for i, entry in ipairs(plan or {}) do
-        result[i] = { name = entry.name, rank = entry.rank, tab = entry.tab }
+        result[i] = { name = entry.name, rank = entry.rank, tab = entry.tab, occurrence = tonumber(entry.occurrence) or 1 }
     end
     return result
 end
@@ -152,15 +204,16 @@ end
 
 local function buildSharedDataText(lists)
     lists = lists or state.savedLists
-    local lines = { 'return {', '  formatVersion = 2,', '  lists = {' }
+    local lines = { 'return {', '  formatVersion = 3,', '  lists = {' }
     local names = {}
     for name in pairs(lists) do names[#names + 1] = name end
     table.sort(names, function(a, b) return a:lower() < b:lower() end)
     for _, name in ipairs(names) do
         lines[#lines + 1] = string.format('    [%s] = {', escapeLuaString(name))
         for _, entry in ipairs(lists[name]) do
-            lines[#lines + 1] = string.format('      {name=%s, rank=%s, tab=%d},',
-                escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0)
+            lines[#lines + 1] = string.format('      {name=%s, rank=%s, tab=%d, occurrence=%d},',
+                escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0,
+                math.max(1, tonumber(entry.occurrence) or 1))
         end
         lines[#lines + 1] = '    },'
     end
@@ -170,11 +223,12 @@ local function buildSharedDataText(lists)
 end
 
 local function buildCharacterDataText()
-    local lines = { 'return {', '  formatVersion = 2,' }
+    local lines = { 'return {', '  formatVersion = 3,' }
     lines[#lines + 1] = '  current = {'
     for _, entry in ipairs(state.plan) do
-        lines[#lines + 1] = string.format('    {name=%s, rank=%s, tab=%d},',
-            escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0)
+        lines[#lines + 1] = string.format('    {name=%s, rank=%s, tab=%d, occurrence=%d},',
+            escapeLuaString(entry.name), escapeLuaString(entry.rank), tonumber(entry.tab) or 0,
+            math.max(1, tonumber(entry.occurrence) or 1))
     end
     lines[#lines + 1] = '  },'
     lines[#lines + 1] = string.format('  compactMode = %s,', tostring(state.compactMode == true))
@@ -593,34 +647,43 @@ local function getCurrentAAPoints()
     return points
 end
 
-local function getAAProgress(name)
+local function getAAProgress(entryOrName, tab, occurrence)
+    local entry = type(entryOrName) == 'table' and entryOrName or nil
+    local name = entry and entry.name or entryOrName
+    tab = entry and entry.tab or tab
+    occurrence = entry and entry.occurrence or occurrence
+
+    local cached = getCatalogAA(name, tab, occurrence)
+
+    -- Exact AA-window occurrence data is authoritative when we have it. This
+    -- avoids collapsing same-name AAs onto whichever object a name-based TLO
+    -- happens to return.
+    if cached and tonumber(cached.tab) == tonumber(tab)
+        and math.max(1, tonumber(cached.occurrence) or 1) == math.max(1, tonumber(occurrence) or 1)
+        and cached.windowRank ~= nil then
+        local rank = tonumber(cached.windowRank) or 0
+        local maxRank = tonumber(cached.maxRank) or 0
+        local cost = math.max(0, tonumber(cached.windowCost) or 0)
+        return rank, maxRank, cost, 'AAWindowOccurrence'
+    end
+
     local personal = mq.TLO.Me.AltAbility(name)
     local global = mq.TLO.AltAbility(name)
     local rank = tonumber(safeAAValue(personal, 'Rank', 0)) or 0
     local maxRank = tonumber(safeAAValue(personal, 'MaxRank', 0)) or 0
     if maxRank <= 0 then maxRank = tonumber(safeAAValue(global, 'MaxRank', 0)) or 0 end
 
-    local cached = state.catalogByName[tostring(name or ''):lower()]
     local windowCost = cached and tonumber(cached.windowCost or 0) or 0
     local windowRank = cached and tonumber(cached.windowRank) or nil
-
-    -- On Triune, AltAbility.Cost can describe the rank just purchased rather
-    -- than the next purchasable rank. The AA window's Cost column is the
-    -- authoritative next-rank price whenever its observed rank matches the
-    -- character's live current rank.
     if windowCost > 0 and windowRank ~= nil and windowRank == rank then
         return rank, maxRank, windowCost, 'AAWindow'
     end
 
     local cost = tonumber(safeAAValue(personal, 'Cost', 0)) or 0
-    if cost > 0 then
-        return rank, maxRank, cost, 'PersonalTLO'
-    end
+    if cost > 0 then return rank, maxRank, cost, 'PersonalTLO' end
 
     cost = tonumber(safeAAValue(global, 'Cost', 0)) or 0
-    if cost > 0 then
-        return rank, maxRank, cost, 'GlobalTLO'
-    end
+    if cost > 0 then return rank, maxRank, cost, 'GlobalTLO' end
 
     return rank, maxRank, 0, 'Unresolved'
 end
@@ -631,120 +694,311 @@ local function getEntryTarget(entry, maxRank)
 end
 
 local function isEntryComplete(entry)
-    local rank, maxRank = getAAProgress(entry.name)
+    local rank, maxRank = getAAProgress(entry)
     local target = getEntryTarget(entry, maxRank)
     return target > 0 and rank >= target
 end
 
-local function getRankCostMap(name)
-    -- MacroQuest exposes the current next-rank cost. Future ranks remain
-    -- unresolved until the preceding rank has actually been purchased.
+local function getRankCostMap(entry)
     local costs = {}
-    local rank, _, cost = getAAProgress(name)
+    local rank, _, cost = getAAProgress(entry)
     if cost > 0 then costs[rank + 1] = cost end
     return costs
 end
 
 local function remainingCostForEntry(entry)
-    local rank, maxRank, nextCost = getAAProgress(entry.name)
+    local rank, maxRank, nextCost = getAAProgress(entry)
     local target = getEntryTarget(entry, maxRank)
     if target <= 0 or rank >= target then return 0, true end
 
-    local costs = getRankCostMap(entry.name)
+    local costs = getRankCostMap(entry)
     local total = 0
     local complete = true
     for wanted = rank + 1, target do
         local cost = costs[wanted]
         if cost == nil and wanted == rank + 1 and nextCost > 0 then cost = nextCost end
-        if cost == nil then
-            complete = false
-        else
-            total = total + cost
-        end
+        if cost == nil then complete = false else total = total + cost end
     end
     return total, complete
 end
 
 
--- Prerequisite handling intentionally separates structural AA metadata from
--- character-specific trained rank data.
---
--- On Project Triune we verified in-game that the global AltAbility object
--- (mq.TLO.AltAbility) reliably exposes RequiresAbility and
--- RequiresAbilityPoints and matches the prerequisite text shown in the AA
--- window. However, its Rank member is NOT the character's trained rank; for
--- example, global AltAbility("First Aid").Rank reported 0 while the character
--- visibly had First Aid 3/3.
---
--- Therefore:
---   * mq.TLO.AltAbility(...) is used only for structural prerequisite metadata.
---   * mq.TLO.Me.AltAbility(...) is used for the live character-owned rank.
---
--- Do not collapse these two reads into one source. The distinction is required
--- for correct prerequisite evaluation on Triune.
-local function getPrerequisiteStructure(name)
+local appendSupportLog
+
+local function prereqDBTabKey(tab)
+    tab = tonumber(tab) or 0
+    if tab == 1 then return 'general' end
+    if tab == 2 then return 'archetype' end
+    if tab == 3 then return 'class' end
+    if tab == 4 then return 'special' end
+    return nil
+end
+
+local function prereqDBRuleSignature(rule)
+    if type(rule) ~= 'table' or type(rule.requires) ~= 'table' or #rule.requires == 0 then
+        return 'none'
+    end
+    local parts = {}
+    for _, req in ipairs(rule.requires) do
+        parts[#parts + 1] = string.format('%s|%d',
+            tostring(req.name or ('#' .. tostring(req.id or 0))):lower(),
+            tonumber(req.points) or 0)
+    end
+    table.sort(parts)
+    return table.concat(parts, '+')
+end
+
+local function prereqDBRuleForRank(record, requestedRank)
+    if type(record) ~= 'table' then return nil, 'record missing' end
+    local rules = record.prerequisiteRules
+    if type(rules) ~= 'table' or #rules == 0 then
+        return { minRank = 1, maxRank = tonumber(record.maxRank) or 1, requires = {} }
+    end
+
+    requestedRank = math.max(1, tonumber(requestedRank) or 1)
+    for _, rule in ipairs(rules) do
+        local minRank = tonumber(rule.minRank) or 1
+        local maxRank = tonumber(rule.maxRank) or minRank
+        if requestedRank >= minRank and requestedRank <= maxRank then
+            return rule
+        end
+    end
+    return nil, string.format('no prerequisite rule covers requested rank %d', requestedRank)
+end
+
+local function lookupPrerequisiteDB(name, tab, aaID, requestedRank)
+    if not prereqDB then
+        return nil, 'PTAAPrereqData is not loaded: ' .. tostring(prereqDBLoadError or 'unknown error')
+    end
+
+    local tabKey = prereqDBTabKey(tab)
+    if not tabKey then return nil, 'invalid AA tab ' .. tostring(tab) end
+    local tabData = prereqDB.tabs and prereqDB.tabs[tabKey]
+    if type(tabData) ~= 'table' or type(tabData.byName) ~= 'table' then
+        return nil, 'database tab data missing for ' .. tostring(tabKey)
+    end
+
+    local key = tostring(name or ''):lower():gsub('^%s+', ''):gsub('%s+$', ''):gsub('%s+', ' ')
+    local candidates = tabData.byName[key]
+    if type(candidates) ~= 'table' or #candidates == 0 then
+        return nil, string.format('no database record for %s in %s', tostring(name), tostring(tabKey))
+    end
+
+    local selected = nil
+    local resolution = nil
+    aaID = tonumber(aaID) or 0
+    if aaID > 0 then
+        for _, record in ipairs(candidates) do
+            if tonumber(record.id) == aaID then
+                selected = record
+                resolution = 'id+tab+name'
+                break
+            end
+        end
+    end
+
+    if not selected and #candidates == 1 then
+        selected = candidates[1]
+        resolution = 'unique-name+tab'
+    end
+
+    if selected then
+        local rule, err = prereqDBRuleForRank(selected, requestedRank)
+        if not rule then return nil, err end
+        local requires = type(rule.requires) == 'table' and rule.requires or {}
+        if #requires > 1 then
+            return nil, string.format('database record has %d simultaneous prerequisites; planner supports one', #requires)
+        end
+        if #requires == 0 then
+            return {
+                source = 'TriuneDB',
+                resolution = resolution,
+                dbID = tonumber(selected.id) or 0,
+                requestedRank = tonumber(requestedRank) or 1,
+                hasPrerequisite = false,
+            }
+        end
+        local req = requires[1]
+        if not req.name or tonumber(req.points or 0) <= 0 then
+            return nil, 'database prerequisite is unresolved or malformed'
+        end
+        return {
+            source = 'TriuneDB',
+            resolution = resolution,
+            dbID = tonumber(selected.id) or 0,
+            requestedRank = tonumber(requestedRank) or 1,
+            hasPrerequisite = true,
+            requiredID = tonumber(req.id) or 0,
+            requiredName = tostring(req.name),
+            requiredRank = tonumber(req.points) or 0,
+        }
+    end
+
+    -- Multiple same-name records in the same tab are safe only when every
+    -- candidate gives the same prerequisite signature for the requested rank.
+    local consensusSignature = nil
+    local consensusRule = nil
+    local candidateIDs = {}
+    for _, record in ipairs(candidates) do
+        candidateIDs[#candidateIDs + 1] = tostring(record.id or '?')
+        local rule, err = prereqDBRuleForRank(record, requestedRank)
+        if not rule then return nil, err end
+        local signature = prereqDBRuleSignature(rule)
+        if consensusSignature == nil then
+            consensusSignature = signature
+            consensusRule = rule
+        elseif signature ~= consensusSignature then
+            return nil, string.format(
+                'ambiguous database records for %s in %s (IDs %s) disagree at rank %d',
+                tostring(name), tostring(tabKey), table.concat(candidateIDs, ','),
+                tonumber(requestedRank) or 1)
+        end
+    end
+
+    local requires = type(consensusRule.requires) == 'table' and consensusRule.requires or {}
+    if #requires > 1 then
+        return nil, string.format('database consensus has %d simultaneous prerequisites; planner supports one', #requires)
+    end
+    if #requires == 0 then
+        return {
+            source = 'TriuneDB',
+            resolution = 'same-name-tab-consensus',
+            dbID = 0,
+            candidateIDs = table.concat(candidateIDs, ','),
+            requestedRank = tonumber(requestedRank) or 1,
+            hasPrerequisite = false,
+        }
+    end
+    local req = requires[1]
+    if not req.name or tonumber(req.points or 0) <= 0 then
+        return nil, 'database consensus prerequisite is unresolved or malformed'
+    end
+    return {
+        source = 'TriuneDB',
+        resolution = 'same-name-tab-consensus',
+        dbID = 0,
+        candidateIDs = table.concat(candidateIDs, ','),
+        requestedRank = tonumber(requestedRank) or 1,
+        hasPrerequisite = true,
+        requiredID = tonumber(req.id) or 0,
+        requiredName = tostring(req.name),
+        requiredRank = tonumber(req.points) or 0,
+    }
+end
+
+local function runPrereqDBLookup(args)
+    args = tostring(args or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    local tabText, name = args:match('^(%S+)%s+(.+)$')
+    if not tabText or not name then
+        print('\ay[AA Planner]\ax Usage: /aaplanner prereqdb <General|Archetype|Class|Special> <AA name>')
+        return false
+    end
+
+    local tab = TAB_IDS[tabText:sub(1,1):upper() .. tabText:sub(2):lower()]
+    if not tab then
+        print('\ar[AA Planner Prereq DB]\ax Invalid tab: ' .. tostring(tabText))
+        return false
+    end
+
+    local cached = getCatalogAA(name, tab)
+    local liveID = cached and tonumber(cached.id) or 0
+    local currentRank = cached and tonumber(cached.windowRank or cached.rank) or 0
+    local maxRank = cached and tonumber(cached.maxRank) or 0
+    local requestedRank = currentRank + 1
+    if maxRank > 0 and requestedRank > maxRank then requestedRank = maxRank end
+    if requestedRank < 1 then requestedRank = 1 end
+
+    local result, err = lookupPrerequisiteDB(name, tab, liveID, requestedRank)
+    if not result then
+        local line = string.format(
+            '[PTAAPlanner] PREREQ DB | AA=%s | Tab=%s | LiveID=%d | Rank=%d | RESULT=FAIL | Reason=%s',
+            tostring(name), TAB_NAMES[tab], liveID, requestedRank, tostring(err))
+        appendSupportLog(line)
+        print('\ar[AA Planner Prereq DB]\ax ' .. line)
+        return false
+    end
+
+    local prereqText = result.hasPrerequisite
+        and string.format('%s rank %d', tostring(result.requiredName), tonumber(result.requiredRank) or 0)
+        or 'none'
+    local line = string.format(
+        '[PTAAPlanner] PREREQ DB | AA=%s | Tab=%s | LiveID=%d | DBID=%d | Rank=%d | Resolution=%s | Prerequisite=%s | CandidateIDs=%s | RESULT=PASS',
+        tostring(name), TAB_NAMES[tab], liveID, tonumber(result.dbID) or 0,
+        requestedRank, tostring(result.resolution), prereqText,
+        tostring(result.candidateIDs or 'n/a'))
+    appendSupportLog(line)
+    print('\at[AA Planner Prereq DB]\ax ' .. line)
+    return true
+end
+
+
+-- Project Triune prerequisite source policy:
+--   * PTAAPrereqData.lua, generated from the Triune database, is authoritative
+--     for structural prerequisite relationships.
+--   * Live character state (Me.AltAbility / fresh AA-window rank) is
+--     authoritative for the character's trained prerequisite rank.
+--   * Structural lookup failure is UNKNOWN: runtime keeps queue priority and
+--     add-time validation rejects rather than guessing.
+local function getPrerequisiteStructure(name, tab, requestedRank, occurrence)
     local key = tostring(name or ''):lower()
     if key == '' then return nil, 'AA name is empty' end
 
-    -- Prerequisite metadata can be rank-specific. Cache it for the current
-    -- rank of the requested AA, not merely for the AA name. After that AA is
-    -- trained, its next rank gets one fresh structural read automatically.
-    local requestedRank = select(1, getAAProgress(name))
-    requestedRank = tonumber(requestedRank) or 0
+    local catalogAA = getCatalogAA(name, tab, occurrence)
+    tab = tonumber(tab) or (catalogAA and tonumber(catalogAA.tab)) or 0
+    occurrence = math.max(1, tonumber(occurrence) or (catalogAA and tonumber(catalogAA.occurrence)) or 1)
+    local duplicateCount = catalogOccurrenceTotal(name, tab)
+    local liveID = (duplicateCount <= 1 and catalogAA) and (tonumber(catalogAA.id) or 0) or 0
 
-    local cached = state.prerequisiteCache[key]
-    if cached
-        and tonumber(cached.generation) == tonumber(state.catalogGeneration)
-        and tonumber(cached.requestedRank) == requestedRank then
+    local currentRank, maxRank = getAAProgress(catalogAA or name, tab, occurrence)
+    currentRank = tonumber(currentRank) or 0
+    maxRank = tonumber(maxRank) or 0
+    requestedRank = tonumber(requestedRank) or (currentRank + 1)
+    if maxRank > 0 and requestedRank > maxRank then requestedRank = maxRank end
+    if requestedRank < 1 then requestedRank = 1 end
+
+    if tab <= 0 then
+        return nil, 'AA tab could not be resolved for authoritative prerequisite lookup'
+    end
+
+    local cacheKey = string.format('%s|%d|%d|%d|%d', key, tab, occurrence, liveID, requestedRank)
+    local cached = state.prerequisiteCache[cacheKey]
+    if cached and tonumber(cached.generation) == tonumber(state.catalogGeneration) then
         return cached
     end
 
-    local global = mq.TLO.AltAbility(name)
-    if not global or not global() then
-        state.prerequisiteCache[key] = nil
-        return nil, 'global AltAbility did not resolve'
-    end
-
-    local requiredID = tonumber(safeAAValue(global, 'RequiresAbility', 0)) or 0
-    local requiredRank = tonumber(safeAAValue(global, 'RequiresAbilityPoints', 0)) or 0
-
-    if requiredID <= 0 then
-        local result = {
-            generation = state.catalogGeneration,
-            requestedRank = requestedRank,
-            hasPrerequisite = false,
-        }
-        state.prerequisiteCache[key] = result
-        return result
-    end
-
-    if requiredRank <= 0 then
-        state.prerequisiteCache[key] = nil
-        return nil, string.format('RequiresAbility=%d but RequiresAbilityPoints=%s',
-            requiredID, tostring(requiredRank))
-    end
-
-    local prerequisiteGlobal = mq.TLO.AltAbility(requiredID)
-    if not prerequisiteGlobal or not prerequisiteGlobal() then
-        state.prerequisiteCache[key] = nil
-        return nil, string.format('prerequisite AA ID %d did not resolve', requiredID)
-    end
-
-    local requiredName = trim(safeAAValue(prerequisiteGlobal, 'Name', ''))
-    if requiredName == '' then
-        state.prerequisiteCache[key] = nil
-        return nil, string.format('prerequisite AA ID %d resolved without a name', requiredID)
+    local dbResult, dbError = lookupPrerequisiteDB(name, tab, liveID, requestedRank)
+    if not dbResult then
+        state.prerequisiteCache[cacheKey] = nil
+        appendSupportLog(string.format(
+            'PREREQ DB STRUCT | AA=%s | Tab=%s | LiveID=%d | Rank=%d | RESULT=UNKNOWN | Reason=%s',
+            tostring(name), tostring(TAB_NAMES[tab] or tab), liveID, requestedRank,
+            tostring(dbError or 'lookup failed')))
+        return nil, 'Triune DB prerequisite lookup failed: ' .. tostring(dbError or 'unknown error')
     end
 
     local result = {
         generation = state.catalogGeneration,
         requestedRank = requestedRank,
-        hasPrerequisite = true,
-        requiredID = requiredID,
-        requiredName = requiredName,
-        requiredRank = requiredRank,
+        hasPrerequisite = dbResult.hasPrerequisite == true,
+        source = 'TriuneDB',
+        resolution = dbResult.resolution,
+        dbID = tonumber(dbResult.dbID) or 0,
     }
-    state.prerequisiteCache[key] = result
+
+    if result.hasPrerequisite then
+        result.requiredID = tonumber(dbResult.requiredID) or 0
+        result.requiredName = dbResult.requiredName
+        result.requiredRank = tonumber(dbResult.requiredRank) or 0
+    end
+
+    state.prerequisiteCache[cacheKey] = result
+    appendSupportLog(string.format(
+        'PREREQ DB STRUCT | AA=%s | Tab=%s | LiveID=%d | DBID=%d | Rank=%d | Resolution=%s | Prerequisite=%s | RESULT=PASS',
+        tostring(name), tostring(TAB_NAMES[tab] or tab), liveID, tonumber(result.dbID) or 0,
+        requestedRank, tostring(result.resolution),
+        result.hasPrerequisite
+            and string.format('%s rank %d', tostring(result.requiredName), tonumber(result.requiredRank) or 0)
+            or 'none'))
     return result
 end
 
@@ -783,8 +1037,8 @@ local function getCharacterAARank(name, id)
     return nil, nil
 end
 
-local function getPrerequisiteStatus(name)
-    local structure, structureError = getPrerequisiteStructure(name)
+local function getPrerequisiteStatus(name, tab, requestedRank, occurrence)
+    local structure, structureError = getPrerequisiteStructure(name, tab, requestedRank, occurrence)
     if not structure then
         return 'unknown', {
             reason = structureError or 'prerequisite structure could not be resolved',
@@ -829,7 +1083,7 @@ local function evaluateQueue()
     local skippedCount = 0
 
     for _, entry in ipairs(state.plan) do
-        local rank, maxRank, cost = getAAProgress(entry.name)
+        local rank, maxRank, cost = getAAProgress(entry)
         local target = getEntryTarget(entry, maxRank)
 
         if target <= 0 then
@@ -842,8 +1096,8 @@ local function evaluateQueue()
             local skipThisEntry = false
 
             if state.skipUnmetPrerequisites then
-                local prereqState, prereqInfo = getPrerequisiteStatus(entry.name)
-                state.prerequisiteRuntimeStatus[entry.name:lower()] = {
+                local prereqState, prereqInfo = getPrerequisiteStatus(entry.name, entry.tab, rank + 1, entry.occurrence)
+                state.prerequisiteRuntimeStatus[entryIdentity(entry)] = {
                     state = prereqState,
                     info = prereqInfo,
                 }
@@ -912,11 +1166,16 @@ local function pruneCompletedPlan()
     return #removed
 end
 
-local function recordAAFromWindow(name, sourceTab, observedRank, observedCost)
+local function recordAAFromWindow(name, sourceTab, observedRank, observedCost, observedMax)
     name = trim(name)
     sourceTab = tonumber(sourceTab) or 0
-    if name == '' or tonumber(name) or state.catalogByName[name:lower()] then return false end
+    if name == '' or tonumber(name) then return false end
     if not TAB_NAMES[sourceTab] then return false end
+
+    local baseKey = catalogBaseKey(name, sourceTab)
+    local occurrence = (tonumber(state.catalogOccurrenceCounts[baseKey]) or 0) + 1
+    state.catalogOccurrenceCounts[baseKey] = occurrence
+    local identityKey = catalogKey(name, sourceTab, occurrence)
 
     -- Catalog membership comes only from a row actually observed in the
     -- character's AA window. MacroQuest AltAbility data is used only to enrich
@@ -945,15 +1204,23 @@ local function recordAAFromWindow(name, sourceTab, observedRank, observedCost)
         name = name,
         tab = sourceTab,
         rank = rank,
-        maxRank = maxRank,
         cost = cost,
         canTrain = canTrain,
-        maxed = maxRank > 0 and rank >= maxRank,
+        id = id,
+        occurrence = occurrence,
+        maxRank = tonumber(observedMax) or maxRank,
+        maxed = (tonumber(observedMax) or maxRank) > 0 and (tonumber(observedRank) or rank) >= (tonumber(observedMax) or maxRank),
         windowRank = tonumber(observedRank),
         windowCost = math.max(0, tonumber(observedCost) or 0),
     }
     state.catalog[#state.catalog + 1] = entry
-    state.catalogByName[name:lower()] = entry
+    state.catalogByKey[identityKey] = entry
+
+    -- Keep the first name-only entry for legacy paths that do not yet carry a
+    -- tab. Cross-tab duplicates are preserved in catalogByKey and catalog.
+    if not state.catalogByName[name:lower()] then
+        state.catalogByName[name:lower()] = entry
+    end
     return true
 end
 
@@ -977,7 +1244,7 @@ local function getAATabBox(window)
 
     -- Custom UIs can nest the tab box. ScreenID remains stable across custom
     -- UIs, so walk descendants looking first for the expected identifiers and
-    -- then for a TabBox with General/Archetype/Class pages.
+    -- then for a TabBox with General/Archetype/Class/Special pages.
     local function walk(node, depth, visited)
         if not node or not node() or depth > 18 or visited.count > 750 then return nil end
         visited.count = visited.count + 1
@@ -996,7 +1263,7 @@ local function getAATabBox(window)
 
         if tostring(controlType or ''):lower() == 'tabbox' then
             local hasExpectedPages = false
-            for _, tabName in ipairs({ 'General', 'Archetype', 'Class' }) do
+            for _, tabName in ipairs({ 'General', 'Archetype', 'Class', 'Special' }) do
                 local page
                 pcall(function() page = node.Tab(tabName) end)
                 if page and page() then
@@ -1090,6 +1357,42 @@ local function scanAAListControl(control, sourceTab, stats)
     pcall(function() count = tonumber(control.Items() or 0) or 0 end)
     if count <= 0 or count > 1000 then return 0 end
 
+    -- Retain compact Special-tab scan details for targeted /aaplanner debug
+    -- diagnostics without enabling automatic verbose logging in releases.
+    if sourceTab == 4 then
+        local controlName, screenID
+        pcall(function() controlName = control.Name() end)
+        pcall(function() screenID = control.ScreenID() end)
+        local detail = {
+            name = tostring(controlName or ''),
+            screenID = tostring(screenID or ''),
+            controlType = tostring(controlType or ''),
+            rows = count,
+            samples = {},
+        }
+        for sampleRow = 1, math.min(count, 3) do
+            local sampleCells = {}
+            for column = 1, 5 do
+                local sampleValue
+                pcall(function() sampleValue = control.List(sampleRow, column)() end)
+                sampleValue = trim(sampleValue)
+                if sampleValue ~= '' and sampleValue ~= 'NULL' then
+                    sampleCells[#sampleCells + 1] = string.format('C%d=%s', column, sampleValue)
+                end
+            end
+            if #sampleCells == 0 then
+                local sampleValue
+                pcall(function() sampleValue = control.List(sampleRow)() end)
+                sampleValue = trim(sampleValue)
+                if sampleValue ~= '' and sampleValue ~= 'NULL' then
+                    sampleCells[1] = 'C1=' .. sampleValue
+                end
+            end
+            detail.samples[#detail.samples + 1] = table.concat(sampleCells, ' | ')
+        end
+        stats.specialControls[#stats.specialControls + 1] = detail
+    end
+
     stats.listControls = stats.listControls + 1
     stats.rows = stats.rows + count
     stats.tabRows[sourceTab] = (stats.tabRows[sourceTab] or 0) + count
@@ -1137,12 +1440,8 @@ local function scanAAListControl(control, sourceTab, stats)
             -- observed rank/cost into the catalog so they are available as a
             -- fallback when the TLO reports Cost=0.
             if title and title ~= '' and title ~= 'NULL' then
-                if recordAAFromWindow(title, sourceTab, observedRank, observedCost) then
+                if recordAAFromWindow(title, sourceTab, observedRank, observedCost, observedMax) then
                     added = added + 1
-                    local cached = state.catalogByName[title:lower()]
-                    if cached and observedMax and cached.maxRank <= 0 then
-                        cached.maxRank = observedMax
-                    end
                 end
             end
         end
@@ -1203,8 +1502,9 @@ local function scanAAWindow()
         rows = 0,
         cells = 0,
         controls = 0,
-        tabRows = { [1] = 0, [2] = 0, [3] = 0 },
-        tabAAs = { [1] = 0, [2] = 0, [3] = 0 },
+        tabRows = { [1] = 0, [2] = 0, [3] = 0, [4] = 0 },
+        tabAAs = { [1] = 0, [2] = 0, [3] = 0, [4] = 0 },
+        specialControls = {},
         tabErrors = {},
     }
 
@@ -1227,7 +1527,7 @@ local function scanAAWindow()
     -- The EQ AA window lazily populates/reuses controls according to the active
     -- page. Select each category before reading its page so the catalog reflects
     -- what the character actually sees in that category.
-    for tab = 1, 3 do
+    for tab = 1, 4 do
         local expectedName = TAB_NAMES[tab]
         local selected, selectErr = selectAATabForCatalog(window, windowName or 'AAWindow',
             tabBox, tab, expectedName)
@@ -1273,6 +1573,8 @@ local function refreshCatalog()
     state.prerequisiteRuntimeStatus = {}
     state.catalog = {}
     state.catalogByName = {}
+    state.catalogByKey = {}
+    state.catalogOccurrenceCounts = {}
     setStatus('Scanning the current character\'s AA window...', 'info')
     scanAAWindow()
     table.sort(state.catalog, function(a, b)
@@ -1283,8 +1585,8 @@ local function refreshCatalog()
     local tabAAs = state.scanStats.tabAAs or {}
     local errorCount = #(state.scanStats.tabErrors or {})
     local message = string.format(
-        'Found %d AAs from the AA window: General %d, Archetype %d, Class %d.',
-        #state.catalog, tonumber(tabAAs[1] or 0), tonumber(tabAAs[2] or 0), tonumber(tabAAs[3] or 0))
+        'Found %d AAs from the AA window: General %d, Archetype %d, Class %d, Special %d.',
+        #state.catalog, tonumber(tabAAs[1] or 0), tonumber(tabAAs[2] or 0), tonumber(tabAAs[3] or 0), tonumber(tabAAs[4] or 0))
 
     if errorCount > 0 then
         message = message .. string.format(' %d tab scan error%s; run /aaplanner debug.',
@@ -1294,21 +1596,192 @@ local function refreshCatalog()
     setStatus(message, (#state.catalog > 0 and errorCount == 0) and 'good' or 'warn')
 end
 
-local function planContains(name)
+local function planContains(aaOrName, tab, occurrence)
+    local wanted
+    if type(aaOrName) == 'table' then
+        wanted = entryIdentity(aaOrName)
+    else
+        wanted = catalogKey(aaOrName, tab, occurrence)
+    end
     for i, entry in ipairs(state.plan) do
-        if entry.name:lower() == name:lower() then return i end
+        if entryIdentity(entry) == wanted then return i end
     end
     return nil
 end
 
-local function addToPlan(aa)
-    if planContains(aa.name) then
+local function planEntryTargetRank(index, requiredName)
+    local entry = state.plan[index]
+    if not entry or entry.name:lower() ~= tostring(requiredName or ''):lower() then return nil end
+    local _, maxRank = getAAProgress(entry)
+    return getEntryTarget(entry, maxRank)
+end
+
+local function findEarlierPlannedPrerequisite(requiredName, requiredRank, beforeIndex)
+    local wanted = tostring(requiredName or ''):lower()
+    local limit = math.max(1, tonumber(beforeIndex) or (#state.plan + 1))
+    for index = 1, math.min(#state.plan, limit - 1) do
+        local entry = state.plan[index]
+        if entry and entry.name:lower() == wanted then
+            local target = planEntryTargetRank(index, requiredName)
+            if target and target >= requiredRank then return index, target end
+            return nil, target, index
+        end
+    end
+    return nil, nil, nil
+end
+
+local function logAddPrereqDebug(message)
+    if not VERBOSE_DEBUG or not appendSupportLog then return end
+    appendSupportLog('[PTAAPlanner] ADD PREREQ ' .. tostring(message or ''))
+end
+
+
+local function validateAddPrerequisiteChain(name, beforeIndex, visited, depth, tab, requestedRank, occurrence)
+    visited = visited or {}
+    depth = tonumber(depth) or 0
+    if depth > 32 then return false, 'prerequisite chain is unexpectedly deep' end
+
+    local key = tostring(name or ''):lower()
+    if key == '' then return false, 'AA name is empty' end
+    if visited[key] then return false, 'prerequisite chain contains a cycle at ' .. tostring(name) end
+    visited[key] = true
+
+    local catalogAA = getCatalogAA(name, tab, occurrence)
+    tab = tonumber(tab) or (catalogAA and tonumber(catalogAA.tab)) or 0
+    occurrence = math.max(1, tonumber(occurrence) or (catalogAA and tonumber(catalogAA.occurrence)) or 1)
+    requestedRank = tonumber(requestedRank)
+    if not requestedRank or requestedRank <= 0 then
+        local _, maxRank = getAAProgress(catalogAA or name, tab, occurrence)
+        requestedRank = tonumber(maxRank) or 0
+    end
+
+    local structure, structureError = getPrerequisiteStructure(name, tab, requestedRank, occurrence)
+    if not structure then
+        visited[key] = nil
+        logAddPrereqDebug(string.format(
+            '%s | Source=TriuneDB | Tab=%s | Rank=%s | Decision=REJECT | Reason=structure unresolved: %s',
+            tostring(name), tostring(TAB_NAMES[tab] or tab), tostring(requestedRank),
+            tostring(structureError or 'unknown')))
+        return false, string.format('Cannot validate prerequisites for %s: %s.',
+            tostring(name), tostring(structureError or 'prerequisite data could not be resolved'))
+    end
+
+    if not structure.hasPrerequisite then
+        visited[key] = nil
+        logAddPrereqDebug(string.format(
+            '%s | Source=TriuneDB | DBID=%d | Tab=%s | Rank=%d | State=none | Decision=ALLOW',
+            tostring(name), tonumber(structure.dbID) or 0, tostring(TAB_NAMES[tab] or tab),
+            tonumber(structure.requestedRank) or 0))
+        return true
+    end
+
+    logAddPrereqDebug(string.format(
+        '%s | Source=TriuneDB | DBID=%d | Tab=%s | Rank=%d | Requires=%s %d | Resolution=%s',
+        tostring(name), tonumber(structure.dbID) or 0, tostring(TAB_NAMES[tab] or tab),
+        tonumber(structure.requestedRank) or 0, tostring(structure.requiredName),
+        tonumber(structure.requiredRank) or 0, tostring(structure.resolution or 'unknown')))
+
+    local currentRank, rankSource = getCharacterAARank(structure.requiredName, structure.requiredID)
+    if currentRank == nil then
+        visited[key] = nil
+        logAddPrereqDebug(string.format('%s | Requires=%s %d | Current=unknown | Decision=REJECT | Reason=owned rank unresolved',
+            tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0)))
+        return false, string.format('Cannot add %s: current rank of prerequisite %s could not be resolved.',
+            tostring(name), tostring(structure.requiredName))
+    end
+
+    if currentRank >= structure.requiredRank then
+        visited[key] = nil
+        logAddPrereqDebug(string.format('%s | Requires=%s %d | Current=%d | Source=%s | Decision=ALLOW | Reason=already trained',
+            tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0),
+            tonumber(currentRank or 0), tostring(rankSource or 'unknown')))
+        return true
+    end
+
+    local plannedIndex, plannedTarget, insufficientIndex =
+        findEarlierPlannedPrerequisite(structure.requiredName, structure.requiredRank, beforeIndex)
+    if not plannedIndex then
+        visited[key] = nil
+        if insufficientIndex then
+            logAddPrereqDebug(string.format('%s | Requires=%s %d | Current=%d | PlannedIndex=%d | PlannedTarget=%s | Decision=REJECT | Reason=planned target too low',
+                tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0),
+                tonumber(currentRank or 0), tonumber(insufficientIndex), tostring(plannedTarget)))
+            return false, string.format('Cannot add %s: prerequisite %s requires rank %d, but its earlier queue entry only targets rank %s.',
+                tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0),
+                tostring(plannedTarget or '?'))
+        end
+        logAddPrereqDebug(string.format('%s | Requires=%s %d | Current=%d | Decision=REJECT | Reason=missing earlier queue prerequisite',
+            tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0),
+            tonumber(currentRank or 0)))
+        return false, string.format('Cannot add %s: requires %s rank %d. Train it first or place it earlier in the priority list.',
+            tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0))
+    end
+
+    local plannedEntry = state.plan[plannedIndex]
+    local prereqTab = plannedEntry and tonumber(plannedEntry.tab) or nil
+    logAddPrereqDebug(string.format('%s | Requires=%s %d | Current=%d | PlannedIndex=%d | PlannedTarget=%d | Decision=CHECK_CHAIN',
+        tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0),
+        tonumber(currentRank or 0), tonumber(plannedIndex), tonumber(plannedTarget or 0)))
+
+    local ok, reason = validateAddPrerequisiteChain(
+        structure.requiredName, plannedIndex, visited, depth + 1, prereqTab, structure.requiredRank, plannedEntry and plannedEntry.occurrence or 1)
+    visited[key] = nil
+    if not ok then return false, reason end
+
+    logAddPrereqDebug(string.format('%s | Requires=%s %d | PlannedIndex=%d | PlannedTarget=%d | Decision=ALLOW | Reason=earlier queue chain valid',
+        tostring(name), tostring(structure.requiredName), tonumber(structure.requiredRank or 0),
+        tonumber(plannedIndex), tonumber(plannedTarget or 0)))
+    return true
+end
+
+local function performAddToPlan(aa)
+    if planContains(aa) then
         setStatus(aa.name .. ' is already in the priority list.', 'warn')
         return
     end
+
+    -- Add-time prerequisite validation never rewrites the user's queue. It only
+    -- uses the authoritative Triune database to verify that an unmet explicit
+    -- prerequisite is already scheduled earlier
+    -- at a sufficient target rank. Unknown prerequisite data fails closed here
+    -- rather than silently making a progression decision for the user.
+    local valid, prerequisiteError = validateAddPrerequisiteChain(aa.name, #state.plan + 1, {}, 0, aa.tab, aa.maxRank, aa.occurrence)
+    if not valid then
+        setStatus(prerequisiteError or ('Cannot add ' .. aa.name .. ': prerequisite validation failed.'), 'warn')
+        return
+    end
+
     local target = aa.maxRank > 0 and tostring(aa.maxRank) or 'M'
-    state.plan[#state.plan + 1] = { name = aa.name, rank = target, tab = aa.tab }
+    state.plan[#state.plan + 1] = { name = aa.name, rank = target, tab = aa.tab, occurrence = math.max(1, tonumber(aa.occurrence) or 1) }
+    logAddPrereqDebug(string.format('%s | Decision=ADDED | QueueIndex=%d | Target=%s', tostring(aa.name), #state.plan, tostring(target)))
     markPlanDirty()
+end
+
+local function queueAddToPlan(aa)
+    if not aa or not aa.name then
+        setStatus('Cannot queue add: AA data is missing.', 'error')
+        return
+    end
+
+    if planContains(aa) then
+        setStatus(aa.name .. ' is already in the priority list.', 'warn')
+        return
+    end
+
+    if state.pendingAddValidation then
+        setStatus('Another AA add is already being validated.', 'warn')
+        return
+    end
+
+    -- Keep the ImGui callback non-blocking. The top-level loop performs
+    -- prerequisite validation and the actual add.
+    state.pendingAddValidation = {
+        name = aa.name,
+        maxRank = tonumber(aa.maxRank or 0) or 0,
+        tab = tonumber(aa.tab or 0) or 0,
+        occurrence = math.max(1, tonumber(aa.occurrence) or 1),
+    }
+    setStatus('Validating prerequisites for ' .. aa.name .. '...', 'info')
 end
 
 local function movePlan(index, delta)
@@ -1327,9 +1800,9 @@ local function decodeField(value)
 end
 
 local function exportPlannerList()
-    local lines = { 'AAPLANNER1' }
+    local lines = { 'AAPLANNER2' }
     for _, entry in ipairs(state.plan) do
-        lines[#lines + 1] = table.concat({ encodeField(entry.name), entry.rank, TAB_NAMES[entry.tab] or '' }, '|')
+        lines[#lines + 1] = table.concat({ encodeField(entry.name), entry.rank, TAB_NAMES[entry.tab] or '', tostring(math.max(1, tonumber(entry.occurrence) or 1)) }, '|')
     end
     return table.concat(lines, '\n')
 end
@@ -1346,31 +1819,40 @@ local function parseImport(text)
     text = tostring(text or ''):gsub('\r', '')
     local imported = {}
     local seen = {}
-    local plannerFormat = text:match('^%s*AAPLANNER1%s*\n') ~= nil
+    local plannerV2 = text:match('^%s*AAPLANNER2%s*\n') ~= nil
+    local plannerV1 = text:match('^%s*AAPLANNER1%s*\n') ~= nil
     local lineNumber = 0
     for line in text:gmatch('[^\n]+') do
         lineNumber = lineNumber + 1
         line = trim(line)
-        if line ~= '' and line ~= 'AAPLANNER1' and not line:match('^%[.-%]$') and not line:match('^[;#]') then
-            local name, rank, tabName
-            if plannerFormat then
+        if line ~= '' and line ~= 'AAPLANNER1' and line ~= 'AAPLANNER2'
+            and not line:match('^%[.-%]$') and not line:match('^[;#]') then
+            local name, rank, tabName, occurrence
+            if plannerV2 then
+                name, rank, tabName, occurrence = line:match('^(.-)|([^|]+)|([^|]*)|([^|]+)$')
+                if name then name = decodeField(name) end
+            elseif plannerV1 then
                 name, rank, tabName = line:match('^(.-)|([^|]+)|([^|]*)$')
                 if name then name = decodeField(name) end
+                occurrence = 1
             else
                 name, rank = line:match('^%d+%s*=%s*(.-)|([^|]+)$')
                 if not name then name, rank = line:match('^(.-)|([^|]+)$') end
+                occurrence = 1
             end
             name = trim(name)
             rank = validateRank(rank)
+            occurrence = math.max(1, tonumber(occurrence) or 1)
             if not name or name == '' or not rank then
                 return nil, string.format('Invalid entry on import line %d.', lineNumber)
             end
-            local key = name:lower()
-            if seen[key] then return nil, 'Duplicate AA in import: ' .. name end
-            seen[key] = true
-            local catalogAA = state.catalogByName[key]
+            local nameKey = name:lower()
+            local catalogAA = state.catalogByName[nameKey]
             local tab = TAB_IDS[trim(tabName)] or (catalogAA and catalogAA.tab) or 0
-            imported[#imported + 1] = { name = name, rank = rank, tab = tab }
+            local key = catalogKey(name, tab, occurrence)
+            if seen[key] then return nil, 'Duplicate AA occurrence in import: ' .. name end
+            seen[key] = true
+            imported[#imported + 1] = { name = name, rank = rank, tab = tab, occurrence = occurrence }
         end
     end
     if #imported == 0 then return nil, 'No AA entries were found in the pasted text.' end
@@ -1392,7 +1874,7 @@ local function getDebugLogPath()
     return pathJoin(configDir, string.format('PTAAPlanner_%s_%s_debug.log', server, character))
 end
 
-local function appendSupportLog(line)
+appendSupportLog = function(line)
     local path = getDebugLogPath()
     if not path then return false end
 
@@ -1426,19 +1908,40 @@ local function writePrioritySnapshot(reason, force)
         tonumber(state.catalogGeneration or 0),
         prereqCacheCount))
 
+    if force == true then
+        local scanStats = state.scanStats or {}
+        local tabRows = scanStats.tabRows or {}
+        local tabAAs = scanStats.tabAAs or {}
+        appendSupportLog(string.format(
+            '[PTAAPlanner] SPECIAL DEBUG | Rows=%d AAs=%d Controls=%d',
+            tonumber(tabRows[4] or 0), tonumber(tabAAs[4] or 0), #(scanStats.specialControls or {})))
+        for i, detail in ipairs(scanStats.specialControls or {}) do
+            appendSupportLog(string.format(
+                '[PTAAPlanner] SPECIAL CONTROL #%d | Name=%s | ScreenID=%s | Type=%s | Rows=%d',
+                i, tostring(detail.name or ''), tostring(detail.screenID or ''),
+                tostring(detail.controlType or ''), tonumber(detail.rows or 0)))
+            for row, sample in ipairs(detail.samples or {}) do
+                appendSupportLog(string.format(
+                    '[PTAAPlanner] SPECIAL SAMPLE #%d.%d | %s', i, row, tostring(sample or '')))
+            end
+        end
+    end
+
     -- Run the same queue evaluator used by the spender/UI so the debug log
     -- shows exactly which entries are being skipped and which AA is the
     -- effective next purchase candidate.
     local candidate, candidateRank, candidateMaxRank, candidateCost, candidateError, queueState = evaluateQueue()
 
     for i, entry in ipairs(state.plan) do
-        local runtime = state.prerequisiteRuntimeStatus[tostring(entry.name or ''):lower()]
+        local runtime = state.prerequisiteRuntimeStatus[entryIdentity(entry)]
         if runtime then
             local info = runtime.info or {}
             appendSupportLog(string.format(
-                '[PTAAPlanner] PREREQ #%d %s | State=%s | Requires=%s | RequiredRank=%s | CurrentRank=%s | Action=%s%s',
+                '[PTAAPlanner] PREREQ #%d %s #%d [%s] | State=%s | Requires=%s | RequiredRank=%s | CurrentRank=%s | Action=%s%s',
                 i,
                 tostring(entry.name),
+                math.max(1, tonumber(entry.occurrence) or 1),
+                tostring(TAB_NAMES[entry.tab] or entry.tab or 'Unknown'),
                 tostring(runtime.state or 'unknown'),
                 tostring(info.requiredName or 'none'),
                 tostring(info.requiredRank or 0),
@@ -1471,13 +1974,15 @@ local function writePrioritySnapshot(reason, force)
     end
 
     for i, entry in ipairs(state.plan) do
-        local currentRank, maxRank, nextCost, costSource = getAAProgress(entry.name)
+        local currentRank, maxRank, nextCost, costSource = getAAProgress(entry)
         local target = getEntryTarget(entry, maxRank)
         local remainingCost, resolved = remainingCostForEntry(entry)
-        local cached = state.catalogByName[tostring(entry.name or ''):lower()]
+        local cached = getCatalogAA(entry.name, entry.tab, entry.occurrence)
         appendSupportLog(string.format(
-            '[PTAAPlanner] #%d %s | Target=%s | Current=%d/%d | NextCost=%d | CostSource=%s | RemainingCost=%d | CostResolved=%s',
-            i, tostring(entry.name), tostring(entry.rank), tonumber(currentRank or 0),
+            '[PTAAPlanner] #%d %s #%d [%s] | Target=%s | Current=%d/%d | NextCost=%d | CostSource=%s | RemainingCost=%d | CostResolved=%s',
+            i, tostring(entry.name), math.max(1, tonumber(entry.occurrence) or 1),
+            tostring(TAB_NAMES[entry.tab] or entry.tab or 'Unknown'),
+            tostring(entry.rank), tonumber(currentRank or 0),
             tonumber(maxRank or 0), tonumber(nextCost or 0), tostring(costSource or 'Unresolved'),
             tonumber(remainingCost or 0), tostring(resolved)))
 
@@ -1569,6 +2074,8 @@ local AA_LIST_CONTROLS = {
     [1] = { 'AAW_GeneralList', 'AA_GeneralList', 'GeneralList', 'List1', 'AAW_List', 'AA_List' },
     [2] = { 'AAW_ArchList', 'AAW_ArchetypeList', 'AA_ArchList', 'AA_ArchetypeList', 'ArchList', 'ArchetypeList', 'List2' },
     [3] = { 'AAW_ClassList', 'AA_ClassList', 'ClassList', 'List3' },
+    -- Live-verified on Project Triune: Special uses AAW_SpecialList / ScreenID List4.
+    [4] = { 'AAW_SpecialList', 'AA_SpecialList', 'SpecialList', 'List4' },
 }
 
 local function selectAATab(tab)
@@ -1583,14 +2090,21 @@ local function selectAATab(tab)
     end)
 end
 
-local function findAAWindowRow(targetName, preferredTab)
+local function findAAWindowRow(targetName, preferredTab, occurrence)
     local window = getAAWindow()
     if not window then return nil end
     local wanted = normalizeAAName(targetName)
-    local tabs = { preferredTab }
-    for tab = 1, 3 do if tab ~= preferredTab then tabs[#tabs + 1] = tab end end
+    occurrence = math.max(1, tonumber(occurrence) or 1)
+
+    local tabs = {}
+    if tonumber(preferredTab) and tonumber(preferredTab) >= 1 and tonumber(preferredTab) <= 4 then
+        tabs[1] = tonumber(preferredTab)
+    else
+        for tab = 1, 4 do tabs[#tabs + 1] = tab end
+    end
 
     for _, tab in ipairs(tabs) do
+        local matchIndex = 0
         for _, controlName in ipairs(AA_LIST_CONTROLS[tab] or {}) do
             local control
             pcall(function() control = window.Child(controlName) end)
@@ -1605,7 +2119,10 @@ local function findAAWindowRow(targetName, preferredTab)
                         pcall(function() value = control.List(row)() end)
                     end
                     if value and normalizeAAName(value) == wanted then
-                        return controlName, row, tab, control
+                        matchIndex = matchIndex + 1
+                        if matchIndex == occurrence then
+                            return controlName, row, tab, control
+                        end
                     end
                 end
             end
@@ -1658,10 +2175,11 @@ local function purchaseSnapshotStillCurrent(task)
         return false, 'effective priority candidate unavailable (' .. tostring(queueStateName) .. ')'
     end
 
-    if normalizeAAName(effectiveEntry.name) ~= normalizeAAName(task.name) then
+    if entryIdentity(effectiveEntry) ~= catalogKey(task.name, task.tab, task.occurrence) then
         return false, string.format(
-            'effective priority candidate changed (%s -> %s)',
-            tostring(task.name), tostring(effectiveEntry.name))
+            'effective priority candidate changed (%s[%d] -> %s[%d])',
+            tostring(task.name), tonumber(task.occurrence) or 1,
+            tostring(effectiveEntry.name), tonumber(effectiveEntry.occurrence) or 1)
     end
 
     if tostring(effectiveEntry.rank or '') ~= tostring(task.targetSpec or '') then
@@ -1790,6 +2308,7 @@ local function nextIncompleteEntry()
     return evaluateQueue()
 end
 
+
 local function stopAutoSpend(message, kind)
     state.autoSpendEnabled = false
     state.autoManageActive = false
@@ -1800,7 +2319,7 @@ end
 
 local function startNativePurchase(entry, rank, cost, manual)
     state.pendingPurchase = {
-        kind = 'aa', name = entry.name, tab = tonumber(entry.tab) or 1,
+        kind = 'aa', name = entry.name, tab = tonumber(entry.tab) or 1, occurrence = math.max(1, tonumber(entry.occurrence) or 1),
         rankBefore = tonumber(rank) or 0, pointsBefore = getCurrentAAPoints(),
         cost = tonumber(cost) or 0, step = 'open', retries = 0,
         openedByUs = false, manual = manual == true,
@@ -1946,7 +2465,7 @@ local function processNativePurchase()
         task.step = 'select_row'
         task.nextStepAt = now + 0.3
     elseif task.step == 'select_row' then
-        local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab)
+        local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab, task.occurrence)
         if not controlName then
             if task.openedByUs then closeAAWindow() end
             stopAutoSpend('Could not locate ' .. task.name .. ' in the AA window. Refresh the catalog and try again.', 'error')
@@ -1973,7 +2492,7 @@ local function processNativePurchase()
         task.step = 'verify_row'
         task.nextStepAt = now + 0.25
     elseif task.step == 'verify_row' then
-        local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab)
+        local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab, task.occurrence)
         if not controlName or foundTab ~= task.tab or row ~= task.selectedRow then
             if task.openedByUs then closeAAWindow() end
             stopAutoSpend('The selected AA row changed before training. No purchase was attempted; Auto Spend has been disabled.', 'error')
@@ -2012,7 +2531,7 @@ local function processNativePurchase()
             return
         end
 
-        local cached = state.catalogByName[tostring(task.name or ''):lower()]
+        local cached = getCatalogAA(task.name, task.tab, task.occurrence)
         if cached then
             cached.windowRank = rowData.currentRank
             cached.windowCost = rowData.cost
@@ -2095,7 +2614,7 @@ local function processNativePurchase()
         -- Fast AA Purchase bypasses the confirmation dialog entirely. Detect
         -- the completed purchase before looking for a dialog so this path is
         -- both safe and immediate.
-        local rankAfter = select(1, getAAProgress(task.name))
+        local rankAfter = select(1, getAAProgress(task.name, task.tab, task.occurrence))
         local pointsAfter = getCurrentAAPoints()
         if rankAfter > task.rankBefore or pointsAfter < task.pointsBefore then
             if task.openedByUs then closeAAWindow() end
@@ -2133,13 +2652,13 @@ local function processNativePurchase()
             task.nextStepAt = now + 0.1
         end
     elseif task.step == 'verify' then
-        local rankAfter = select(1, getAAProgress(task.name))
+        local rankAfter = select(1, getAAProgress(task.name, task.tab, task.occurrence))
         local pointsAfter = getCurrentAAPoints()
         if rankAfter > task.rankBefore or pointsAfter < task.pointsBefore then
             if task.openedByUs then closeAAWindow() end
             finishPurchaseSuccess(task, rankAfter, pointsAfter)
         elseif now - (task.clickedAt or task.startedAt) > 6 then
-            local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab)
+            local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab, task.occurrence)
             local rowData = controlName and foundTab == task.tab and readAAWindowRowData(control, row) or nil
             local windowRank = rowData and rowData.currentRank or nil
             local windowCost = rowData and tonumber(rowData.cost or 0) or 0
@@ -2148,7 +2667,7 @@ local function processNativePurchase()
                 appendSupportLog(string.format(
                     '[PTAAPlanner] PURCHASE FAILURE COST MISMATCH %s | rank=%d attemptedCost=%d windowCost=%d | retrying with window cost',
                     task.name, task.rankBefore, tonumber(task.cost or 0), windowCost))
-                local cached = state.catalogByName[tostring(task.name or ''):lower()]
+                local cached = getCatalogAA(task.name, task.tab, task.occurrence)
                 if cached then
                     cached.windowRank = windowRank
                     cached.windowCost = windowCost
@@ -2215,12 +2734,18 @@ local function drawCatalogTab(tab)
         for _, aa in ipairs(state.catalog) do
             if aa.tab == tab and (query == '' or aa.name:lower():find(query, 1, true)) and (not state.hideMaxed or not aa.maxed) then
                 any = true
-                ImGui.PushID('catalog_' .. aa.name)
+                ImGui.PushID(string.format('catalog_%d_%s_%d', aa.tab, aa.name, tonumber(aa.occurrence) or 1))
                 local rankText = aa.maxRank > 0 and string.format('%d/%d', aa.rank, aa.maxRank) or tostring(aa.rank)
-                if ImGui.Button(planContains(aa.name) and 'Added' or 'Add', 52, 0) and not planContains(aa.name) then addToPlan(aa) end
+                if ImGui.Button(planContains(aa) and 'Added' or 'Add', 52, 0) and not planContains(aa) then
+                    queueAddToPlan(aa)
+                end
                 ImGui.SameLine()
-                if aa.maxed then ImGui.TextColored(0.35, 0.9, 0.55, 1, aa.name)
-                else ImGui.Text(aa.name) end
+                local aaLabel = aa.name
+                if catalogOccurrenceTotal(aa.name, aa.tab) > 1 then
+                    aaLabel = string.format('%s [%d]', aa.name, tonumber(aa.occurrence) or 1)
+                end
+                if aa.maxed then ImGui.TextColored(0.35, 0.9, 0.55, 1, aaLabel)
+                else ImGui.Text(aaLabel) end
                 ImGui.SameLine()
                 ImGui.TextDisabled(string.format('Rank %s  Next cost: %d', rankText, aa.cost))
                 if ImGui.IsItemHovered() then
@@ -2319,7 +2844,7 @@ local function drawPriorityList()
     ImGui.Separator()
     if ImGui.BeginChild('priority_list', 0, 310, true) then
         for i, entry in ipairs(state.plan) do
-            ImGui.PushID('plan_' .. i .. '_' .. entry.name)
+            ImGui.PushID(string.format('plan_%d_%s_%d_%d', i, entry.name, tonumber(entry.tab) or 0, tonumber(entry.occurrence) or 1))
             ImGui.Text(string.format('%d.', i))
             ImGui.SameLine()
             if ImGui.SmallButton('Up') then movePlan(i, -1) end
@@ -2335,9 +2860,11 @@ local function drawPriorityList()
             if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', 'Target rank, or M for maximum available rank.') end
             ImGui.SameLine()
             local tabLabel = TAB_NAMES[entry.tab] or 'Unknown'
-            ImGui.Text(string.format('%s  [%s]', entry.name, tabLabel))
+            local occurrenceLabel = catalogOccurrenceTotal(entry.name, entry.tab) > 1
+                and string.format(' #%d', math.max(1, tonumber(entry.occurrence) or 1)) or ''
+            ImGui.Text(string.format('%s%s  [%s]', entry.name, occurrenceLabel, tabLabel))
 
-            local prereqRuntime = state.prerequisiteRuntimeStatus[entry.name:lower()]
+            local prereqRuntime = state.prerequisiteRuntimeStatus[entryIdentity(entry)]
             if state.skipUnmetPrerequisites and prereqRuntime and prereqRuntime.state == 'unmet' then
                 local info = prereqRuntime.info or {}
                 ImGui.SameLine()
@@ -2589,6 +3116,7 @@ local function drawMainWindow()
                 drawCatalogTab(1)
                 drawCatalogTab(2)
                 drawCatalogTab(3)
+                drawCatalogTab(4)
                 ImGui.EndTabBar()
             end
             ImGui.TableNextColumn()
@@ -2605,29 +3133,58 @@ end
 loadSavedData()
 recalculatePlannerStats()
 
-mq.bind('/aaplanner', function(command)
-    command = trim(command):lower()
-    if command == 'quit' or command == 'exit' then open = false
-    elseif command == 'refresh' then state.scanRequested = true
-    elseif command == 'debug' then
+mq.bind('/aaplanner', function(...)
+    -- MacroQuest passes bound command arguments as separate callback arguments.
+    -- Reconstruct the full argument string so multi-word AA names survive intact.
+    local parts = { ... }
+    for i = 1, #parts do
+        parts[i] = tostring(parts[i] or '')
+    end
+    local rawCommand = trim(table.concat(parts, ' '))
+    local commandName, commandArgs = rawCommand:match('^(%S+)%s*(.-)$')
+    commandName = (commandName or ''):lower()
+    commandArgs = trim(commandArgs or '')
+
+    if commandName == 'quit' or commandName == 'exit' then open = false
+    elseif commandName == 'refresh' then state.scanRequested = true
+    elseif commandName == 'prereqdb' then
+        runPrereqDBLookup(commandArgs)
+    elseif commandName == 'debug' then
         recalculatePlannerStats()
-        local counts = { 0, 0, 0 }
+        local counts = { 0, 0, 0, 0 }
         for _, aa in ipairs(state.catalog) do
             if counts[aa.tab] then counts[aa.tab] = counts[aa.tab] + 1 end
         end
         print(string.format('\at[AA Planner Debug]\ax Version=%s VerboseDebug=%s', VERSION, tostring(VERBOSE_DEBUG)))
-        print(string.format('\at[AA Planner Debug]\ax General=%d Archetype=%d Class=%d Plan=%d NativeAutoSpend=%s',
-            counts[1], counts[2], counts[3], #state.plan, tostring(state.autoSpendEnabled)))
+        print(string.format('\at[AA Planner Debug]\ax PrereqDB Loaded=%s Schema=%s Error=%s',
+            tostring(prereqDB ~= nil),
+            prereqDB and tostring(prereqDB.schemaVersion) or 'none',
+            tostring(prereqDBLoadError or 'none')))
+        local duplicateNames = 0
+        local seenCatalogNames = {}
+        for _, aa in ipairs(state.catalog) do
+            local key = tostring(aa.name or ''):lower()
+            if seenCatalogNames[key] then
+                duplicateNames = duplicateNames + 1
+            else
+                seenCatalogNames[key] = true
+            end
+        end
+        print(string.format('\at[AA Planner Debug]\ax CatalogOccurrences=%d CrossTabDuplicateOccurrences=%d',
+            #state.catalog, duplicateNames))
+        print(string.format('\at[AA Planner Debug]\ax General=%d Archetype=%d Class=%d Special=%d Plan=%d NativeAutoSpend=%s',
+            counts[1], counts[2], counts[3], counts[4], #state.plan, tostring(state.autoSpendEnabled)))
         print(string.format('\at[AA Planner Debug]\ax AAWindow=%s Controls=%d Lists=%d Rows=%d Cells=%d',
             tostring(state.scanStats.window), tonumber(state.scanStats.controls or 0),
             tonumber(state.scanStats.listControls or 0), tonumber(state.scanStats.rows or 0),
             tonumber(state.scanStats.cells or 0)))
         local tabRows = state.scanStats.tabRows or {}
         local tabAAs = state.scanStats.tabAAs or {}
-        print(string.format('\at[AA Planner Debug]\ax ScanByTab General=%d rows/%d AAs Archetype=%d rows/%d AAs Class=%d rows/%d AAs',
+        print(string.format('\at[AA Planner Debug]\ax ScanByTab General=%d rows/%d AAs Archetype=%d rows/%d AAs Class=%d rows/%d AAs Special=%d rows/%d AAs',
             tonumber(tabRows[1] or 0), tonumber(tabAAs[1] or 0),
             tonumber(tabRows[2] or 0), tonumber(tabAAs[2] or 0),
-            tonumber(tabRows[3] or 0), tonumber(tabAAs[3] or 0)))
+            tonumber(tabRows[3] or 0), tonumber(tabAAs[3] or 0),
+            tonumber(tabRows[4] or 0), tonumber(tabAAs[4] or 0)))
         for i, err in ipairs(state.scanStats.tabErrors or {}) do
             print(string.format('\ar[AA Planner Debug]\ax TabScanError[%d]=%s', i, tostring(err)))
         end
@@ -2652,14 +3209,14 @@ mq.bind('/aaplanner', function(command)
         writePrioritySnapshot('/aaplanner debug', true)
         print(string.format('\at[AA Planner Debug]\ax Priority snapshot appended to %s',
             tostring(getDebugLogPath() or 'debug log unavailable')))
-    elseif command == 'compact' then
+    elseif commandName == 'compact' then
         open = true
         setCompactMode(true)
-    elseif command == 'full' then
+    elseif commandName == 'full' then
         open = true
         setCompactMode(false)
-    elseif command == 'show' or command == '' then open = true
-    else print('\at[AA Planner]\ax /aaplanner [show|compact|full|refresh|debug|quit]') end
+    elseif commandName == 'show' or commandName == '' then open = true
+    else print('\at[AA Planner]\ax /aaplanner [show|compact|full|refresh|debug|prereqdb <tab> <AA name>|quit]') end
 end)
 
 mq.imgui.init('AAPlanner', drawMainWindow)
@@ -2696,13 +3253,45 @@ local function processPendingSharedListMutation()
     return false
 end
 
+local function processPendingAddValidation()
+    if not state.pendingAddValidation then return false end
+
+    local request = state.pendingAddValidation
+    state.pendingAddValidation = nil
+
+    local aa = getCatalogAA(request.name, request.tab, request.occurrence)
+    if not aa then
+        aa = {
+            name = request.name,
+            maxRank = request.maxRank,
+            tab = request.tab,
+            occurrence = request.occurrence,
+        }
+    end
+
+    performAddToPlan(aa)
+    return true
+end
+
+
 while open do
     clearExpiredStatus()
     if state.scanRequested then state.scanRequested = false; refreshCatalog() end
     if state.enableRequested then state.enableRequested = false; enableAutoSpend() end
     processPendingSharedListMutation()
+    processPendingAddValidation()
 
     processNativePurchase()
+
+    -- Auto Spend has one purchase gate: the user-configurable checks in
+    -- playerBusyReason(). AAPlanner does not pause, resume, or otherwise
+    -- control TAC. Disabling a safety check explicitly allows purchases while
+    -- that condition is true.
+    if not state.pendingPurchase
+        and state.autoSpendEnabled
+        and monotonicSeconds() >= (state.nextSpendAt or 0) then
+        requestSpendPass(false)
+    end
 
     local now = os.time()
     if now ~= state.maintenanceAt then
@@ -2716,12 +3305,10 @@ while open do
             state.sharedListsRefreshAt = sharedNow + 2
         end
 
-        if not state.pendingPurchase and monotonicSeconds() >= (state.nextSpendAt or 0) then
-            if state.manualSpendQueued then
-                requestSpendPass(true)
-            elseif state.autoSpendEnabled then
-                requestSpendPass(false)
-            end
+        if not state.pendingPurchase
+            and state.manualSpendQueued
+            and monotonicSeconds() >= (state.nextSpendAt or 0) then
+            requestSpendPass(true)
         end
     end
 
