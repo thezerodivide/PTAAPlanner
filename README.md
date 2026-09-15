@@ -198,7 +198,7 @@ Auto Spend is stopped when conditions such as the following occur:
 * The selected row cannot be safely verified
 * An unrelated confirmation dialog is already open
 * The confirmation dialog does not match the planned AA
-* AA prerequisites or level requirements are not met
+* AA prerequisites are not met
 * A purchase cannot be verified after it is attempted
 
 This behavior favors stopping safely over risking an unintended AA purchase.
