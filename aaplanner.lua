@@ -8,7 +8,7 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local APP_NAME = 'Project Triune AA Planner'
-local VERSION = '0.2.3'
+local VERSION = '0.2.4'
 local open = true
 
 -- Authoritative Project Triune prerequisite data generated from the server database.
@@ -26,6 +26,11 @@ do
             or tostring(data)
     end
 end
+
+-- PEQ descriptions are stored in the existing prerequisite database module.
+-- The planner chooses an exact ID and rank only when a caret is opened.
+local descriptionDB = prereqDB
+local descriptionDBLoadError = prereqDBLoadError
 
 -- Build-time diagnostic policy:
 --   Test/internal builds: set VERBOSE_DEBUG = true so automatic snapshots are captured.
@@ -53,6 +58,10 @@ local state = {
     catalogByKey = {},
     catalogOccurrenceCounts = {},
     catalogGeneration = 0,
+    descriptionCache = {},
+    descriptionIdentity = {},
+    descriptionExpanded = {},
+    pendingDescription = nil,
     prerequisiteCache = {},
     prerequisiteRuntimeStatus = {},
     plan = {},
@@ -75,6 +84,8 @@ local state = {
     autoManageActive = false,
     autoSpendEnabled = false,
     skipUnmetPrerequisites = false,
+    skipUnresolvedAAs = false, -- opt-in; only failed recoverable pre-Train attempts
+    unresolvedSkips = {}, -- transient exact occurrence + rank + plan generation
     aaPoints = 0,
     queueCost = 0,
     queueCostComplete = true,
@@ -86,6 +97,8 @@ local state = {
     sharedListsRefreshAt = 0,
     pendingPurchase = nil,
     manualSpendQueued = false,
+    catalogRecovery = nil, -- one automatic Refresh Catalog retry per purchase/state key
+
     nextSpendAt = 0,
     lastObservedAAPoints = nil,
     scanStats = { window = 'none', listControls = 0, rows = 0, cells = 0 },
@@ -233,6 +246,7 @@ local function buildCharacterDataText()
     lines[#lines + 1] = '  },'
     lines[#lines + 1] = string.format('  compactMode = %s,', tostring(state.compactMode == true))
     lines[#lines + 1] = string.format('  skipUnmetPrerequisites = %s,', tostring(state.skipUnmetPrerequisites == true))
+    lines[#lines + 1] = string.format('  skipUnresolvedAAs = %s,', tostring(state.skipUnresolvedAAs == true))
     lines[#lines + 1] = string.format('  safetyCheckCasting = %s,', tostring(state.safetyCheckCasting == true))
     lines[#lines + 1] = string.format('  safetyCheckMoving = %s,', tostring(state.safetyCheckMoving == true))
     lines[#lines + 1] = string.format('  safetyCheckNavigating = %s,', tostring(state.safetyCheckNavigating == true))
@@ -558,6 +572,9 @@ local function writeCharacterData()
         if data.skipUnmetPrerequisites ~= (state.skipUnmetPrerequisites == true) then
             return false, 'Character-state verification failed: prerequisite-skip setting did not match.'
         end
+        if data.skipUnresolvedAAs ~= (state.skipUnresolvedAAs == true) then
+            return false, 'Character-state verification failed: unresolved-AA setting did not match.'
+        end
         return true
     end)
     if ok then state.dirty = false end
@@ -569,6 +586,9 @@ local function loadCharacterSettings(data)
     if type(data.compactMode) == 'boolean' then state.compactMode = data.compactMode end
     if type(data.skipUnmetPrerequisites) == 'boolean' then
         state.skipUnmetPrerequisites = data.skipUnmetPrerequisites
+    end
+    if type(data.skipUnresolvedAAs) == 'boolean' then
+        state.skipUnresolvedAAs = data.skipUnresolvedAAs
     end
     if type(data.safetyCheckCasting) == 'boolean' then state.safetyCheckCasting = data.safetyCheckCasting end
     if type(data.safetyCheckMoving) == 'boolean' then state.safetyCheckMoving = data.safetyCheckMoving end
@@ -628,6 +648,7 @@ end
 local function markPlanDirty()
     state.dirty = true
     state.planGeneration = (tonumber(state.planGeneration) or 0) + 1
+    state.unresolvedSkips = {}
 end
 
 local function safeAAValue(aa, member, default)
@@ -1078,21 +1099,31 @@ local function getPrerequisiteStatus(name, tab, requestedRank, occurrence)
     return 'met', info
 end
 
+local function unresolvedSkipKey(entry, rank)
+    return string.format('%s|%d|%d', entryIdentity(entry),
+        tonumber(rank) or -1, tonumber(state.planGeneration) or 0)
+end
+
 local function evaluateQueue()
     state.prerequisiteRuntimeStatus = {}
     local skippedCount = 0
+    local unresolvedCount = 0
 
     for _, entry in ipairs(state.plan) do
         local rank, maxRank, cost = getAAProgress(entry)
         local target = getEntryTarget(entry, maxRank)
+        local unresolved = state.skipUnresolvedAAs and
+            state.unresolvedSkips[unresolvedSkipKey(entry, rank)]
 
-        if target <= 0 then
+        if unresolved then
+            unresolvedCount = unresolvedCount + 1
+        elseif target <= 0 then
             return entry, rank, maxRank, cost,
                 'target rank could not be resolved',
-                { state = 'candidate', skippedCount = skippedCount }
+                { state = 'candidate', skippedCount = skippedCount, unresolvedCount = unresolvedCount }
         end
 
-        if rank < target then
+        if not unresolved and rank < target then
             local skipThisEntry = false
 
             if state.skipUnmetPrerequisites then
@@ -1114,18 +1145,22 @@ local function evaluateQueue()
 
             if not skipThisEntry then
                 return entry, rank, maxRank, cost, nil,
-                    { state = 'candidate', skippedCount = skippedCount }
+                    { state = 'candidate', skippedCount = skippedCount, unresolvedCount = unresolvedCount }
             end
         end
     end
 
+    if unresolvedCount > 0 then
+        return nil, nil, nil, nil, nil,
+            { state = 'all_skipped', skippedCount = skippedCount, unresolvedCount = unresolvedCount }
+    end
     if skippedCount > 0 then
         return nil, nil, nil, nil, nil,
-            { state = 'all_blocked', skippedCount = skippedCount }
+            { state = 'all_blocked', skippedCount = skippedCount, unresolvedCount = 0 }
     end
 
     return nil, nil, nil, nil, nil,
-        { state = 'complete', skippedCount = 0 }
+        { state = 'complete', skippedCount = 0, unresolvedCount = 0 }
 end
 
 local function recalculatePlannerStats()
@@ -1565,10 +1600,14 @@ local function scanAAWindow()
     if not wasOpen then mq.cmd('/windowstate AAWindow close') end
 end
 
-local function refreshCatalog()
+local function refreshCatalog(preserveUnresolvedSkips)
     -- Structural prerequisite metadata is cached only for this catalog
     -- generation. A refresh invalidates the cache; nothing is persisted.
     state.catalogGeneration = (tonumber(state.catalogGeneration) or 0) + 1
+    if not preserveUnresolvedSkips then state.unresolvedSkips = {} end
+    state.descriptionCache = {}
+    state.descriptionIdentity = {}
+    state.pendingDescription = nil
     state.prerequisiteCache = {}
     state.prerequisiteRuntimeStatus = {}
     state.catalog = {}
@@ -1907,6 +1946,12 @@ local function writePrioritySnapshot(reason, force)
         tostring(state.skipUnmetPrerequisites == true),
         tonumber(state.catalogGeneration or 0),
         prereqCacheCount))
+    local unresolvedSkipCount = 0
+    for _ in pairs(state.unresolvedSkips or {}) do unresolvedSkipCount = unresolvedSkipCount + 1 end
+    appendSupportLog(string.format(
+        '[PTAAPlanner] UNRESOLVED DEBUG | Enabled=%s | ActiveSkips=%d | PlanGeneration=%d',
+        tostring(state.skipUnresolvedAAs == true), unresolvedSkipCount,
+        tonumber(state.planGeneration or 0)))
 
     if force == true then
         local scanStats = state.scanStats or {}
@@ -1953,19 +1998,21 @@ local function writePrioritySnapshot(reason, force)
 
     if candidate then
         appendSupportLog(string.format(
-            '[PTAAPlanner] QUEUE CANDIDATE %s | Rank=%d/%d | Target=%d | Cost=%d | SkippedBefore=%d%s',
+            '[PTAAPlanner] QUEUE CANDIDATE %s | Rank=%d/%d | Target=%d | Cost=%d | PrereqBlockedBefore=%d | UnresolvedBefore=%d%s',
             tostring(candidate.name),
             tonumber(candidateRank or 0),
             tonumber(candidateMaxRank or 0),
             tonumber(getEntryTarget(candidate, candidateMaxRank) or 0),
             tonumber(candidateCost or 0),
             tonumber(queueState and queueState.skippedCount or 0),
+            tonumber(queueState and queueState.unresolvedCount or 0),
             candidateError and (' | Error=' .. tostring(candidateError)) or ''))
     else
         appendSupportLog(string.format(
-            '[PTAAPlanner] QUEUE RESULT %s | Skipped=%d',
+            '[PTAAPlanner] QUEUE RESULT %s | PrereqBlocked=%d | Unresolved=%d',
             tostring(queueState and queueState.state or 'unknown'),
-            tonumber(queueState and queueState.skippedCount or 0)))
+            tonumber(queueState and queueState.skippedCount or 0),
+            tonumber(queueState and queueState.unresolvedCount or 0)))
     end
 
     if #state.plan == 0 then
@@ -2317,7 +2364,151 @@ local function stopAutoSpend(message, kind)
     if message then setStatus(message, kind or 'error') end
 end
 
+local function recoveryKey(name, tab, occurrence, rank, planGeneration)
+    return string.format('%s|%d|%d|%d|%d',
+        normalizeAAName(name or ''),
+        tonumber(tab) or 0,
+        math.max(1, tonumber(occurrence) or 1),
+        tonumber(rank) or -1,
+        tonumber(planGeneration) or tonumber(state.planGeneration) or 0)
+end
+
+local function taskRecoveryKey(task)
+    if not task then return nil end
+    return recoveryKey(task.name, task.tab, task.occurrence, task.rankBefore, task.planGeneration)
+end
+
+local function skipUnresolvedCandidate(entry, rank, reason, task, manual)
+    -- A Train click makes the result uncertain until the rank/point checks
+    -- finish. Only a failure before that click can safely move down the queue.
+    if not state.skipUnresolvedAAs or not entry or
+        (task and (task.step == 'wait_confirmation' or task.step == 'verify')) then
+        return false
+    end
+    local recovery = state.catalogRecovery
+    local recoveryAttemptKey = recoveryKey(entry.name, entry.tab, entry.occurrence,
+        rank, task and task.planGeneration or state.planGeneration)
+    if not recovery or recovery.key ~= recoveryAttemptKey then return false end
+    local key = unresolvedSkipKey(entry, rank)
+    local firstReason = recovery and recovery.reason or 'none'
+    state.unresolvedSkips[key] = {
+        reason = tostring(reason or 'unresolved after Refresh Catalog'),
+        firstReason = tostring(firstReason),
+        at = monotonicSeconds(),
+    }
+    if task and task.openedByUs then closeAAWindow() end
+    state.pendingPurchase = nil
+    state.catalogRecovery = nil
+    state.manualSpendQueued = manual == true or (task and task.manual == true) or false
+    state.nextSpendAt = monotonicSeconds() + 0.25
+    appendSupportLog(string.format(
+        '[PTAAPlanner] UNRESOLVED SKIP | Key=%s | AA=%s | Tab=%s | Occurrence=%s | Rank=%s | FirstReason=%s | RetryReason=%s | Manual=%s | Points=%d | Action=NEXT QUEUE ENTRY',
+        key, tostring(entry.name), tostring(entry.tab), tostring(entry.occurrence),
+        tostring(rank), tostring(firstReason), tostring(reason),
+        tostring(state.manualSpendQueued), getCurrentAAPoints()))
+    local nextEntry, nextRank, _, nextCost, nextError, queueState = evaluateQueue()
+    appendSupportLog(string.format(
+        '[PTAAPlanner] UNRESOLVED NEXT | SkippedKey=%s | Candidate=%s | Tab=%s | Occurrence=%s | Rank=%s | Cost=%s | Error=%s | QueueState=%s | Unresolved=%d | PrereqBlocked=%d',
+        key, nextEntry and tostring(nextEntry.name) or 'none',
+        nextEntry and tostring(nextEntry.tab) or 'none',
+        nextEntry and tostring(nextEntry.occurrence) or 'none',
+        tostring(nextRank), tostring(nextCost), tostring(nextError or 'none'),
+        queueState and tostring(queueState.state) or 'unknown',
+        queueState and tonumber(queueState.unresolvedCount or 0) or 0,
+        queueState and tonumber(queueState.skippedCount or 0) or 0))
+    setStatus(string.format('Skipped unresolved %s for now. Checking the next queued AA.',
+        tostring(entry.name)), 'warn', 8)
+    return true
+end
+
+local function clearRecoveryIfDifferent(key)
+    if state.catalogRecovery and state.catalogRecovery.key ~= key then
+        appendSupportLog(string.format(
+            '[PTAAPlanner] RECOVERY CLEARED | PreviousKey=%s | NewKey=%s | Reason=candidate changed',
+            tostring(state.catalogRecovery.key), tostring(key)))
+        state.catalogRecovery = nil
+    end
+end
+
+local function attemptCatalogRecovery(key, reason, task, now, manual)
+    key = tostring(key or '')
+    reason = tostring(reason or 'catalog/state error')
+    now = tonumber(now) or monotonicSeconds()
+
+    if key == '' then
+        return false
+    end
+
+    if state.catalogRecovery and state.catalogRecovery.key == key then
+        local canSkip = state.skipUnresolvedAAs and
+            not (task and (task.step == 'wait_confirmation' or task.step == 'verify'))
+        appendSupportLog(string.format(
+            '[PTAAPlanner] RECOVERY FAILED | Key=%s | FirstReason=%s | RetryReason=%s | Action=%s',
+            key, tostring(state.catalogRecovery.reason), reason, canSkip and 'SKIP CANDIDATE' or 'STOP'))
+        return false
+    end
+
+    state.catalogRecovery = {
+        key = key,
+        reason = reason,
+        attemptedAt = now,
+        catalogGenerationBefore = tonumber(state.catalogGeneration) or 0,
+    }
+
+    if task and task.openedByUs then closeAAWindow() end
+    state.pendingPurchase = nil
+    -- A manual request may fail before a purchase task exists. Preserve that
+    -- request so it receives its one retry even with Auto Spend disabled.
+    if manual or (task and task.manual) then state.manualSpendQueued = true end
+
+    appendSupportLog(string.format(
+        '[PTAAPlanner] RECOVERY | Key=%s | Reason=%s | Action=REFRESH CATALOG | Attempt=1 | CatalogGeneration=%d',
+        key, reason, tonumber(state.catalogGeneration) or 0))
+    setStatus('AAPlanner encountered a recoverable AA state error. Refreshing the AA catalog and retrying once...', 'warn', 8)
+
+    refreshCatalog(true)
+    recalculatePlannerStats()
+    state.nextSpendAt = monotonicSeconds() + 0.25
+
+    appendSupportLog(string.format(
+        '[PTAAPlanner] RECOVERY REFRESH COMPLETE | Key=%s | CatalogGeneration=%d | CatalogEntries=%d | ScanErrors=%d',
+        key, tonumber(state.catalogGeneration) or 0, #state.catalog,
+        #(state.scanStats.tabErrors or {})))
+    return true
+end
+
+local function recoverTaskOrStop(task, reason, finalMessage, now)
+    if task and (task.step == 'wait_confirmation' or task.step == 'verify') then
+        appendSupportLog(string.format(
+            '[PTAAPlanner] PURCHASE OUTCOME AMBIGUOUS | AA=%s | Tab=%s | Occurrence=%s | Step=%s | Reason=%s | Action=STOP WITHOUT RETRY',
+            tostring(task.name), tostring(task.tab), tostring(task.occurrence),
+            tostring(task.step), tostring(reason)))
+        stopAutoSpend(finalMessage or
+            ('Purchase of ' .. tostring(task.name) .. ' could not be confirmed. Auto Spend stopped for review.'), 'error')
+        return false
+    end
+    local key = taskRecoveryKey(task)
+    if key and attemptCatalogRecovery(key, reason, task, now, task and task.manual) then
+        return true
+    end
+    if skipUnresolvedCandidate(task, task and task.rankBefore, reason, task) then return true end
+    stopAutoSpend(finalMessage or
+        ('AAPlanner could not recover from: ' .. tostring(reason) .. '. Auto Spend has been disabled.'), 'error')
+    return false
+end
+
+local function stopForUnsafeIdentity(task, reason, message)
+    appendSupportLog(string.format(
+        '[PTAAPlanner] UNSAFE IDENTITY | AA=%s | Tab=%s | Occurrence=%s | Step=%s | Reason=%s | Action=STOP WITHOUT REFRESH',
+        task and tostring(task.name) or '<unknown>', task and tostring(task.tab) or 'nil',
+        task and tostring(task.occurrence) or 'nil', task and tostring(task.step) or 'nil',
+        tostring(reason)))
+    stopAutoSpend(message, 'error')
+end
+
 local function startNativePurchase(entry, rank, cost, manual)
+    local key = recoveryKey(entry.name, entry.tab, entry.occurrence, rank, state.planGeneration)
+    clearRecoveryIfDifferent(key)
     state.pendingPurchase = {
         kind = 'aa', name = entry.name, tab = tonumber(entry.tab) or 1, occurrence = math.max(1, tonumber(entry.occurrence) or 1),
         rankBefore = tonumber(rank) or 0, pointsBefore = getCurrentAAPoints(),
@@ -2347,14 +2538,41 @@ local function requestSpendPass(manual)
     recalculatePlannerStats()
     local entry, rank, maxRank, cost, resolveError, queueState = nextIncompleteEntry()
     if entry then
+        local retryKey = recoveryKey(entry.name, entry.tab, entry.occurrence, rank, state.planGeneration)
+        if state.catalogRecovery and state.catalogRecovery.key == retryKey then
+            local exact = state.catalogByKey[catalogKey(entry.name, entry.tab, entry.occurrence)]
+            if not exact then
+                appendSupportLog(string.format(
+                    '[PTAAPlanner] RECOVERY FAILED | Key=%s | RetryReason=exact AA row absent from refreshed catalog | Action=%s',
+                    retryKey, state.skipUnresolvedAAs and 'SKIP CANDIDATE' or 'STOP'))
+                if skipUnresolvedCandidate(entry, rank, 'exact AA row absent from refreshed catalog', nil, manual) then
+                    return false
+                end
+                stopAutoSpend('The planned AA row is absent after Refresh Catalog. No purchase was attempted; Auto Spend has been disabled.', 'error')
+                return false
+            end
+            appendSupportLog(string.format(
+                '[PTAAPlanner] RECOVERY RETRY | Key=%s | AA=%s | Tab=%s | Occurrence=%d | Rank=%s | Cost=%s | Manual=%s',
+                retryKey, tostring(entry.name), tostring(entry.tab), tonumber(entry.occurrence) or 1,
+                tostring(rank), tostring(cost), tostring(manual == true)))
+        end
         if resolveError then
-            if manual then setStatus(string.format('Cannot purchase %s: %s. Refresh the AA catalog and verify its target rank.', entry.name, resolveError), 'error') end
+            local key = recoveryKey(entry.name, entry.tab, entry.occurrence, rank, state.planGeneration)
+            local reason = string.format('queue candidate unresolved: %s', tostring(resolveError))
+            if attemptCatalogRecovery(key, reason, nil, monotonicSeconds(), manual) then return false end
+            if skipUnresolvedCandidate(entry, rank, reason, nil, manual) then return false end
+            stopAutoSpend(string.format(
+                'Cannot purchase %s after Refresh Catalog: %s. Auto Spend has been disabled.',
+                entry.name, tostring(resolveError)), 'error')
             return false
         end
         cost = math.floor(tonumber(cost) or 0)
         if cost <= 0 then
-            if manual then setStatus('Cannot purchase ' .. entry.name .. ': its next-rank cost is unresolved. Refresh the AA catalog.', 'error') end
-            state.nextSpendAt = monotonicSeconds() + 5
+            local key = recoveryKey(entry.name, entry.tab, entry.occurrence, rank, state.planGeneration)
+            if attemptCatalogRecovery(key, 'next-rank cost is unresolved', nil, monotonicSeconds(), manual) then return false end
+            if skipUnresolvedCandidate(entry, rank, 'next-rank cost is unresolved', nil, manual) then return false end
+            stopAutoSpend('Cannot purchase ' .. entry.name ..
+                ' because its next-rank cost is still unresolved after Refresh Catalog. Auto Spend has been disabled.', 'error')
             return false
         end
         if state.aaPoints < cost then
@@ -2384,6 +2602,14 @@ local function requestSpendPass(manual)
         end
         return false
     end
+    if queueState and queueState.state == 'all_skipped' then
+        if manual then
+            setStatus(string.format('No purchasable AA remains: %d unresolved, %d blocked by prerequisites. Refresh Catalog or edit the queue to retry.',
+                tonumber(queueState.unresolvedCount or 0), tonumber(queueState.skippedCount or 0)), 'warn')
+        end
+        state.nextSpendAt = monotonicSeconds() + 2
+        return false
+    end
 
     if manual then
         setStatus('The priority list is complete.', 'info')
@@ -2392,9 +2618,27 @@ local function requestSpendPass(manual)
 end
 
 local function finishPurchaseSuccess(task, rankAfter, pointsAfter)
+    if tonumber(rankAfter) == nil or rankAfter <= task.rankBefore then
+        appendSupportLog(string.format(
+            '[PTAAPlanner] PURCHASE OUTCOME AMBIGUOUS | AA=%s | ExpectedRank=%d | ObservedRank=%s | PointsBefore=%s | PointsAfter=%s | Reason=points changed but rank did not confirm | Action=STOP WITHOUT RETRY',
+            tostring(task.name), task.rankBefore + 1, tostring(rankAfter),
+            tostring(task.pointsBefore), tostring(pointsAfter)))
+        stopAutoSpend('AA points changed for ' .. tostring(task.name) ..
+            ', but the new rank could not be confirmed. Auto Spend stopped for review.', 'error')
+        return false
+    end
+    local key = taskRecoveryKey(task)
+    if state.catalogRecovery and key and state.catalogRecovery.key == key then
+        appendSupportLog(string.format(
+            '[PTAAPlanner] RECOVERY SUCCESS | Key=%s | AA=%s | PurchasedRank=%d | Action=CONTINUE',
+            key, tostring(task.name), tonumber(rankAfter) or 0))
+        state.catalogRecovery = nil
+    end
     setStatus(string.format('Purchased %s rank %d. %d AA points remain.', task.name, rankAfter, pointsAfter), 'good', 6)
     appendSupportLog(string.format('[PTAAPlanner] PURCHASED %s rank %d; points %d -> %d',
         task.name, rankAfter, task.pointsBefore, pointsAfter))
+    -- The next rank can have different database wording.
+    state.descriptionCache[entryIdentity(task)] = nil
     pruneCompletedPlan()
     state.pendingPurchase = nil
     state.nextSpendAt = monotonicSeconds() + 0.75
@@ -2493,7 +2737,11 @@ local function processNativePurchase()
             openAAWindow(task.retries)
             task.nextStepAt = now + 0.4
         else
-            stopAutoSpend('Could not open the Alternate Advancement window. Auto Spend has been disabled.', 'error')
+            recoverTaskOrStop(
+                task,
+                'could not open the Alternate Advancement window',
+                'Could not open the Alternate Advancement window even after Refresh Catalog. Auto Spend has been disabled.',
+                now)
         end
     elseif task.step == 'select_tab' then
         selectAATab(task.tab)
@@ -2502,15 +2750,16 @@ local function processNativePurchase()
     elseif task.step == 'select_row' then
         local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab, task.occurrence)
         if not controlName then
-            if task.openedByUs then closeAAWindow() end
-            stopAutoSpend('Could not locate ' .. task.name .. ' in the AA window. Refresh the catalog and try again.', 'error')
+            recoverTaskOrStop(
+                task,
+                'could not locate the planned AA row in the AA window',
+                'Could not locate ' .. task.name .. ' in the AA window even after Refresh Catalog. Auto Spend has been disabled.',
+                now)
             return
         end
         if foundTab ~= task.tab then
-            task.tab = foundTab
-            selectAATab(foundTab)
-            task.step = 'select_row'
-            task.nextStepAt = now + 0.3
+            stopForUnsafeIdentity(task, 'AA row found in a different tab (' .. tostring(foundTab) .. ')',
+                'The selected AA row did not match the planned tab. No purchase was attempted; Auto Spend has been disabled.')
             return
         end
         local _, windowName = getAAWindow()
@@ -2528,23 +2777,47 @@ local function processNativePurchase()
         task.nextStepAt = now + 0.25
     elseif task.step == 'verify_row' then
         local controlName, row, foundTab, control = findAAWindowRow(task.name, task.tab, task.occurrence)
-        if not controlName or foundTab ~= task.tab or row ~= task.selectedRow then
-            if task.openedByUs then closeAAWindow() end
-            stopAutoSpend('The selected AA row changed before training. No purchase was attempted; Auto Spend has been disabled.', 'error')
+        if not controlName then
+            recoverTaskOrStop(
+                task,
+                'planned AA row disappeared before training',
+                'The planned AA row is still missing after Refresh Catalog. No purchase was attempted; Auto Spend has been disabled.',
+                now)
+            return
+        end
+        if foundTab ~= task.tab or row ~= task.selectedRow then
+            stopForUnsafeIdentity(task,
+                string.format('row identity changed: expected tab=%s row=%s, found tab=%s row=%s',
+                    tostring(task.tab), tostring(task.selectedRow), tostring(foundTab), tostring(row)),
+                'The selected AA row changed before training. No purchase was attempted; Auto Spend has been disabled.')
             return
         end
 
         local rowData = readAAWindowRowData(control, row)
-        if not rowData or normalizeAAName(rowData.title) ~= normalizeAAName(task.name) then
-            if task.openedByUs then closeAAWindow() end
-            state.pendingPurchase = nil
-            state.nextSpendAt = now + 2
-            setStatus('Could not verify the selected AA row data. No purchase was attempted; the planner will retry.', 'warn')
-            appendSupportLog(string.format('[PTAAPlanner] WINDOW VERIFY FAILED %s | row data unavailable or title mismatch', task.name))
+        if not rowData then
+            appendSupportLog(string.format(
+                '[PTAAPlanner] WINDOW VERIFY FAILED %s | row data unavailable',
+                task.name))
+            recoverTaskOrStop(
+                task,
+                'AA-window row data unavailable',
+                'Could not read the AA row after Refresh Catalog. No purchase was attempted; Auto Spend has been disabled.',
+                now)
+            return
+        end
+        if normalizeAAName(rowData.title) ~= normalizeAAName(task.name) then
+            stopForUnsafeIdentity(task,
+                string.format('title mismatch: expected=%s actual=%s', tostring(task.name), tostring(rowData.title)),
+                'The selected AA title did not match the planned AA. No purchase was attempted; Auto Spend has been disabled.')
             return
         end
 
         if rowData.currentRank == nil or rowData.currentRank ~= task.rankBefore then
+            if rowData.currentRank == nil then
+                recoverTaskOrStop(task, 'AA-window rank could not be read',
+                    'The AA-window rank is still unreadable after Refresh Catalog. No purchase was attempted; Auto Spend has been disabled.', now)
+                return
+            end
             local cached = getCatalogAA(task.name, task.tab, task.occurrence)
             if rowData.currentRank ~= nil and cached then
                 local oldRank = cached.windowRank
@@ -2579,13 +2852,15 @@ local function processNativePurchase()
         end
 
         if rowData.cost <= 0 then
-            if task.openedByUs then closeAAWindow() end
-            state.pendingPurchase = nil
-            state.nextSpendAt = now + 2
             appendSupportLog(string.format(
                 '[PTAAPlanner] WINDOW COST UNRESOLVED %s | rank=%d cachedCost=%d',
                 task.name, task.rankBefore, tonumber(task.cost or 0)))
-            setStatus('The AA window did not expose a valid next-rank cost for ' .. task.name .. '. Retrying shortly.', 'warn')
+            recoverTaskOrStop(
+                task,
+                'AA window did not expose a valid next-rank cost',
+                'The AA window still did not expose a valid next-rank cost for ' .. task.name ..
+                    ' after Refresh Catalog. Auto Spend has been disabled.',
+                now)
             return
         end
 
@@ -2631,9 +2906,13 @@ local function processNativePurchase()
         local control = window and findChildRecursive(window, task.selectedControlName)
         local selectedRow = getSelectedListRow(control)
         if selectedRow and selectedRow ~= task.selectedRow then
-            if task.openedByUs then closeAAWindow() end
-            stopAutoSpend(string.format('AA selection verification failed: expected row %d but the window selected row %d. No purchase was attempted.',
-                task.selectedRow, selectedRow), 'error')
+            stopForUnsafeIdentity(
+                task,
+                string.format('AA selection verification failed: expected row %d, selected row %d',
+                    task.selectedRow, selectedRow),
+                string.format(
+                    'AA selection verification failed: expected row %d but the window selected row %d. No purchase was attempted; Auto Spend has been disabled.',
+                    task.selectedRow, selectedRow))
             return
         end
         task.step = 'click_train'
@@ -2735,31 +3014,28 @@ local function processNativePurchase()
 
             if rowData and windowRank == task.rankBefore and windowCost > 0 and windowCost ~= tonumber(task.cost or 0) then
                 appendSupportLog(string.format(
-                    '[PTAAPlanner] PURCHASE FAILURE COST MISMATCH %s | rank=%d attemptedCost=%d windowCost=%d | retrying with window cost',
+                    '[PTAAPlanner] PURCHASE OUTCOME AMBIGUOUS | AA=%s | Rank=%d | AttemptedCost=%d | WindowCost=%d | Reason=cost changed after Train click | Action=STOP WITHOUT RETRY',
                     task.name, task.rankBefore, tonumber(task.cost or 0), windowCost))
-                local cached = getCatalogAA(task.name, task.tab, task.occurrence)
-                if cached then
-                    cached.windowRank = windowRank
-                    cached.windowCost = windowCost
-                end
                 if task.openedByUs then closeAAWindow() end
-                state.pendingPurchase = nil
-                state.nextSpendAt = now + 0.25
-                recalculatePlannerStats()
-                setStatus(string.format('The AA window reports %d AA for %s. Updated the cost and will retry.',
-                    windowCost, task.name), 'warn', 6)
+                stopAutoSpend('The AA cost changed after Train was clicked for ' .. tostring(task.name) ..
+                    '. Auto Spend stopped for review.', 'error')
                 return
             end
 
             local canTrain = aaCanTrain(task.name)
-            if task.openedByUs then closeAAWindow() end
-            stopAutoSpend(string.format(
-                'Purchase of %s rank %d was not confirmed after verifying the AA window. Auto Spend has been disabled for review.',
-                task.name, task.rankBefore + 1), 'error')
             appendSupportLog(string.format(
                 '[PTAAPlanner] PURCHASE TIMEOUT %s rank %d | points=%d | WindowRank=%s | WindowCost=%s | AttemptedCost=%d | CanTrain=%s',
                 task.name, task.rankBefore + 1, pointsAfter,
                 tostring(windowRank), tostring(windowCost), tonumber(task.cost or 0), tostring(canTrain)))
+            recoverTaskOrStop(
+                task,
+                string.format(
+                    'purchase was not confirmed after AA-window verification (rank=%d points=%d windowRank=%s windowCost=%s CanTrain=%s)',
+                    task.rankBefore + 1, pointsAfter, tostring(windowRank), tostring(windowCost), tostring(canTrain)),
+                string.format(
+                    'Purchase of %s rank %d still could not be confirmed after Refresh Catalog. Auto Spend has been disabled for review.',
+                    task.name, task.rankBefore + 1),
+                now)
         else
             task.nextStepAt = now + 0.25
         end
@@ -2770,6 +3046,12 @@ local function enableAutoSpend()
     if #state.plan == 0 then
         setStatus('The priority list is empty.', 'warn')
         return
+    end
+    if state.catalogRecovery then
+        appendSupportLog(string.format(
+            '[PTAAPlanner] RECOVERY CLEARED | PreviousKey=%s | Reason=explicit Auto Spend restart',
+            tostring(state.catalogRecovery.key)))
+        state.catalogRecovery = nil
     end
     state.autoSpendEnabled = true
     state.autoManageActive = true
@@ -2783,6 +3065,226 @@ local function sortedSavedNames()
     for name in pairs(state.savedLists) do names[#names + 1] = name end
     table.sort(names, function(a, b) return a:lower() < b:lower() end)
     return names
+end
+
+local function cleanAADescription(raw)
+    local value = tostring(raw or '')
+    value = value:gsub('<[Bb][Rr]%s*/?>', '\n'):gsub('<[^>]*>', '')
+    value = value:gsub('&nbsp;', ' '):gsub('&lt;', '<'):gsub('&gt;', '>')
+        :gsub('&quot;', '"'):gsub('&apos;', "'"):gsub('&amp;', '&')
+    return trim(value:gsub('\r\n?', '\n'):gsub('[ \t]+\n', '\n')
+        :gsub('\n[ \t]+', '\n'):gsub('\n\n\n+', '\n\n'))
+end
+
+local function descriptionDBCandidates(entry)
+    if not descriptionDB then return nil, 'PTAAPrereqData.lua is unavailable: ' .. tostring(descriptionDBLoadError) end
+    if type(descriptionDB.descriptionStrings) ~= 'table' or
+        type(descriptionDB.descriptionSIDsByID) ~= 'table' then
+        return nil, 'PTAAPrereqData.lua does not contain PEQ descriptions. Install the updated data file.'
+    end
+    if not prereqDB then return nil, 'PTAAPrereqData.lua is unavailable.' end
+    local tabKey = prereqDBTabKey(entry.tab)
+    local tabData = tabKey and prereqDB.tabs and prereqDB.tabs[tabKey]
+    local nameKey = tostring(entry.name or ''):lower():gsub('^%s+', ''):gsub('%s+$', ''):gsub('%s+', ' ')
+    local candidates = tabData and tabData.byName and tabData.byName[nameKey]
+    if type(candidates) ~= 'table' or #candidates == 0 then
+        return nil, 'No matching AA in the Triune database.'
+    end
+    return candidates
+end
+
+local function putAADescriptionInCache(entry, abilityID, candidates)
+    local ids = descriptionDB.descriptionSIDsByID and descriptionDB.descriptionSIDsByID[tonumber(abilityID) or 0]
+    local valid = false
+    for _, candidate in ipairs(candidates) do
+        if tonumber(candidate.id) == tonumber(abilityID) then valid = true; break end
+    end
+    if not valid or not ids then return nil, 'The exact AA ID is absent from Triune description data.' end
+    local _, maxRank = getAAProgress(entry)
+    local currentRank = select(1, getAAProgress(entry))
+    local desiredRank = math.max(1, (tonumber(currentRank) or 0) + 1)
+    if tonumber(maxRank or 0) > 0 then desiredRank = math.min(desiredRank, tonumber(maxRank)) end
+    local descriptionRank = math.min(desiredRank, #ids)
+    local sid = ids[descriptionRank]
+    local description = sid and descriptionDB.descriptionStrings[sid]
+    -- Some PEQ ranks have no text. The first rank's wording is still the
+    -- database's wording for this AA, and is safer than inventing an explanation.
+    if not description then
+        sid = ids[1]
+        description = sid and descriptionDB.descriptionStrings[sid]
+        descriptionRank = 1
+    end
+    local cleaned = cleanAADescription(description)
+    if cleaned == '' then return nil, 'Triune database has no description for this AA.' end
+    state.descriptionCache[entryIdentity(entry)] = { text = cleaned, id = abilityID,
+        rank = descriptionRank, sid = sid }
+    appendSupportLog(string.format('[PTAAPlanner] DESCRIPTION READY | AA=%s | Tab=%s | Occurrence=%s | DBID=%d | Rank=%d | SID=%s | Characters=%d',
+        tostring(entry.name), tostring(entry.tab), tostring(entry.occurrence),
+        tonumber(abilityID), descriptionRank, tostring(sid), #cleaned))
+    return true
+end
+
+local function failAADescription(entry, reason)
+    state.descriptionCache[entryIdentity(entry)] = { error = reason }
+    appendSupportLog(string.format('[PTAAPlanner] DESCRIPTION UNAVAILABLE | AA=%s | Tab=%s | Occurrence=%s | Reason=%s',
+        tostring(entry.name), tostring(entry.tab), tostring(entry.occurrence), tostring(reason)))
+end
+
+local function requestAADescription(entry)
+    local key = entryIdentity(entry)
+    if state.descriptionCache[key] or state.pendingDescription then return end
+    if not state.catalogByKey[key] then return failAADescription(entry, 'AA is absent from the current catalog.') end
+    local candidates, errorText = descriptionDBCandidates(entry)
+    if not candidates then return failAADescription(entry, errorText) end
+    if #candidates == 1 and catalogOccurrenceTotal(entry.name, entry.tab) <= 1 then
+        local ok, err = putAADescriptionInCache(entry, candidates[1].id, candidates)
+        if not ok then failAADescription(entry, err) end
+        return
+    end
+    local mapped = state.descriptionIdentity[key]
+    if mapped then
+        local ok, err = putAADescriptionInCache(entry, mapped, candidates)
+        if not ok then failAADescription(entry, err) end
+        return
+    end
+    state.pendingDescription = {
+        name = entry.name, tab = entry.tab, occurrence = entry.occurrence,
+        key = key, generation = state.catalogGeneration,
+        step = 'open', startedAt = monotonicSeconds(), nextStepAt = 0,
+        openedByUs = false,
+    }
+    appendSupportLog(string.format('[PTAAPlanner] DESCRIPTION ID REQUEST | AA=%s | Tab=%s | Occurrence=%s | Candidates=%d | Action=SELECT EXACT ROW',
+        tostring(entry.name), tostring(entry.tab), tostring(entry.occurrence), #candidates))
+end
+
+local function processAADescription()
+    local task = state.pendingDescription
+    if not task or state.pendingPurchase or state.manualSpendQueued or state.scanRequested then return end
+    if task.generation ~= state.catalogGeneration then state.pendingDescription = nil; return end
+    local now = monotonicSeconds()
+    if now < task.nextStepAt then return end
+    local function finish(id, reason)
+        state.pendingDescription = nil
+        local entry = { name = task.name, tab = task.tab, occurrence = task.occurrence }
+        if id then
+            local candidates = descriptionDBCandidates(entry)
+            local ok, err = candidates and putAADescriptionInCache(entry, id, candidates)
+            if ok then state.descriptionIdentity[task.key] = id
+            else failAADescription(entry, err or 'AA ID could not be matched to Triune data.') end
+        else failAADescription(entry, reason) end
+        if task.openedByUs and not state.pendingPurchase then closeAAWindow() end
+    end
+    if task.step == 'open' then
+        if isAAWindowOpen() then task.step = 'select_tab'
+        else
+            task.openedByUs = true
+            openAAWindow(1)
+            task.step = 'wait_open'
+            task.nextStepAt = now + 0.5
+        end
+    elseif task.step == 'wait_open' then
+        if isAAWindowOpen() then task.step = 'select_tab'
+        elseif now - task.startedAt > 4 then finish(nil, 'Could not open the AA window to identify this duplicate.')
+        else task.nextStepAt = now + 0.2 end
+    elseif task.step == 'select_tab' then
+        selectAATab(task.tab)
+        task.step = 'select_row'
+        task.nextStepAt = now + 0.3
+    elseif task.step == 'select_row' then
+        local name, row, foundTab, control = findAAWindowRow(task.name, task.tab, task.occurrence)
+        if not name or foundTab ~= task.tab then
+            finish(nil, 'Exact AA row was not found; Refresh Catalog to retry.')
+            return
+        end
+        local _, windowName = getAAWindow()
+        local notifyName = name
+        pcall(function()
+            local screenID = control and control.ScreenID()
+            if screenID and screenID ~= '' and screenID ~= 'NULL' then notifyName = screenID end
+        end)
+        pcall(function() if control and control.Select then control.Select(row) end end)
+        mq.cmdf('/nomodkey /notify %s %s listselect %d', windowName or 'AAWindow', notifyName, row)
+        task.controlName, task.row = notifyName, row
+        task.step = 'read_id'
+        task.nextStepAt = now + 0.2
+    elseif task.step == 'read_id' then
+        local window = getAAWindow()
+        local control = window and findChildRecursive(window, task.controlName)
+        if not control or getSelectedListRow(control) ~= task.row then
+            finish(nil, 'Selected AA row could not be confirmed.')
+            return
+        end
+        local rowData = readAAWindowRowData(control, task.row)
+        if not rowData or normalizeAAName(rowData.title) ~= normalizeAAName(task.name) then
+            finish(nil, 'Selected AA name changed before ID lookup.')
+            return
+        end
+        local descControl = window and findChildRecursive(window, 'AAW_Description')
+        local raw
+        pcall(function() raw = descControl and descControl.Text() end)
+        local id = tonumber(tostring(raw or ''):match('%[/alt toggle%s+(%d+)%]'))
+        if not id then finish(nil, 'Exact AA ID was not exposed by the selected row.'); return end
+        finish(id)
+    end
+end
+
+local function drawAADescriptionCaret(entry)
+    local key = entryIdentity(entry)
+    local expanded = state.descriptionExpanded[key] == true
+    if ImGui.SmallButton(expanded and 'v##description' or '>##description') then
+        state.descriptionExpanded[key] = not expanded or nil
+    end
+end
+
+local function wrapAADescriptionLines(value, width)
+    local result = {}
+    width = math.max(80, tonumber(width) or 400)
+    local function textWidth(s)
+        local measured
+        pcall(function() measured = select(1, ImGui.CalcTextSize(s)) end)
+        if type(measured) == 'table' then measured = measured.x or measured[1] end
+        if type(measured) == 'userdata' then
+            pcall(function() measured = measured.x end)
+        end
+        return tonumber(measured) or #s * 8
+    end
+    for paragraph in (tostring(value or '') .. '\n'):gmatch('(.-)\n') do
+        local line = ''
+        for spaces, word in paragraph:gmatch('(%s*)(%S+)') do
+            local nextLine = line == '' and word or (line .. spaces .. word)
+            if line ~= '' and textWidth(nextLine) > width then
+                result[#result + 1] = line
+                line = word
+            else
+                line = nextLine
+            end
+        end
+        result[#result + 1] = line
+    end
+    return result
+end
+
+local function drawAADescriptionBody(entry)
+    local key = entryIdentity(entry)
+    if not state.descriptionExpanded[key] then return end
+    local cached = state.descriptionCache[key]
+    if not cached then requestAADescription(entry); cached = state.descriptionCache[key] end
+    if cached and (cached.text or cached.error) then
+        ImGui.Indent(20)
+        local available
+        pcall(function() available = select(1, ImGui.GetContentRegionAvail()) end)
+        if type(available) == 'table' then available = available.x or available[1] end
+        if type(available) == 'userdata' then
+            pcall(function() available = available.x end)
+        end
+        local width = (tonumber(available) or 430) - 22
+        for _, line in ipairs(wrapAADescriptionLines(cached.text or cached.error, width)) do
+            if line == '' then ImGui.Spacing()
+            elseif cached.error then ImGui.TextDisabled(line)
+            else ImGui.Text('%s', line) end
+        end
+        ImGui.Unindent(20)
+    else ImGui.TextDisabled(state.pendingPurchase and 'Description waits until purchase finishes.' or 'Loading description...') end
 end
 
 local function drawCatalogTab(tab)
@@ -2810,6 +3312,8 @@ local function drawCatalogTab(tab)
                     queueAddToPlan(aa)
                 end
                 ImGui.SameLine()
+                drawAADescriptionCaret(aa)
+                ImGui.SameLine()
                 local aaLabel = aa.name
                 if catalogOccurrenceTotal(aa.name, aa.tab) > 1 then
                     aaLabel = string.format('%s [%d]', aa.name, tonumber(aa.occurrence) or 1)
@@ -2822,6 +3326,7 @@ local function drawCatalogTab(tab)
                     ImGui.SetTooltip('%s', string.format('%s\nCurrent rank: %d\nMaximum rank: %d\nCan train next rank: %s',
                         aa.name, aa.rank, aa.maxRank, aa.canTrain and 'Yes' or 'No'))
                 end
+                drawAADescriptionBody(aa)
                 ImGui.PopID()
             end
         end
@@ -2855,6 +3360,18 @@ local function drawPriorityList()
         ImGui.SetTooltip('%s',
             'Only confirmed unmet AA prerequisites are skipped. The AA stays in its original queue position and is re-evaluated every pass.')
     end
+    local skipUnresolved = ImGui.Checkbox('Skip unresolved AAs after retry', state.skipUnresolvedAAs)
+    if skipUnresolved ~= state.skipUnresolvedAAs then
+        state.skipUnresolvedAAs = skipUnresolved
+        state.unresolvedSkips = {}
+        markDirty()
+        appendSupportLog(string.format('[PTAAPlanner] UNRESOLVED SKIP OPTION | Enabled=%s | TransientSkipsCleared=true',
+            tostring(state.skipUnresolvedAAs)))
+    end
+    if ImGui.IsItemHovered() then
+        ImGui.SetTooltip('%s',
+            'After Refresh Catalog and one failed retry, skip an unresolved AA before Train and check the next entry. Identity and uncertain purchase outcomes still stop. Refresh Catalog or edit the queue to retry skipped AAs.')
+    end
 
     local nextCost, nextName, nextRank, nextTarget, _, nextQueueState = getTopPriorityCost()
     if nextName then
@@ -2877,6 +3394,11 @@ local function drawPriorityList()
             ImGui.TextDisabled(string.format('%d queued AA%s currently skipped.',
                 tonumber(nextQueueState.skippedCount or 0),
                 tonumber(nextQueueState.skippedCount or 0) == 1 and ' is' or 's are'))
+        elseif nextQueueState and nextQueueState.state == 'all_skipped' then
+            ImGui.TextDisabled('Next Purchase: none — waiting on skipped AAs')
+            ImGui.TextDisabled(string.format('%d unresolved; %d blocked by prerequisites. Refresh Catalog to retry.',
+                tonumber(nextQueueState.unresolvedCount or 0),
+                tonumber(nextQueueState.skippedCount or 0)))
         else
             ImGui.TextDisabled('Next Purchase: none')
             ImGui.TextDisabled('Cost: 0 AA')
@@ -2933,6 +3455,8 @@ local function drawPriorityList()
             local occurrenceLabel = catalogOccurrenceTotal(entry.name, entry.tab) > 1
                 and string.format(' #%d', math.max(1, tonumber(entry.occurrence) or 1)) or ''
             ImGui.Text(string.format('%s%s  [%s]', entry.name, occurrenceLabel, tabLabel))
+            ImGui.SameLine()
+            drawAADescriptionCaret(entry)
 
             local prereqRuntime = state.prerequisiteRuntimeStatus[entryIdentity(entry)]
             if state.skipUnmetPrerequisites and prereqRuntime and prereqRuntime.state == 'unmet' then
@@ -2946,6 +3470,16 @@ local function drawPriorityList()
                         tonumber(info.currentRank or 0)))
                 end
             end
+            local currentRank = select(1, getAAProgress(entry))
+            local unresolved = state.skipUnresolvedAAs and state.unresolvedSkips[unresolvedSkipKey(entry, currentRank)]
+            if unresolved then
+                ImGui.TextDisabled('  Skipped: unresolved after retry')
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('%s', string.format('First error: %s\nRetry error: %s\nRefresh Catalog or edit the queue to retry.',
+                        tostring(unresolved.firstReason), tostring(unresolved.reason)))
+                end
+            end
+            drawAADescriptionBody(entry)
             ImGui.PopID()
         end
     end
@@ -2957,6 +3491,12 @@ local function drawPriorityList()
             setStatus('Queued Spend Next request cancelled.', 'info')
         end
     elseif ImGui.Button('Spend Next Now', 190, 32) then
+        if state.catalogRecovery then
+            appendSupportLog(string.format(
+                '[PTAAPlanner] RECOVERY CLEARED | PreviousKey=%s | Reason=explicit Spend Next request',
+                tostring(state.catalogRecovery.key)))
+            state.catalogRecovery = nil
+        end
         requestSpendPass(true)
     end
     ImGui.SameLine()
@@ -3230,6 +3770,10 @@ mq.bind('/aaplanner', function(...)
             tostring(prereqDB ~= nil),
             prereqDB and tostring(prereqDB.schemaVersion) or 'none',
             tostring(prereqDBLoadError or 'none')))
+        print(string.format('\at[AA Planner Debug]\ax TriuneDB Descriptions=%s Error=%s',
+            tostring(descriptionDB ~= nil and type(descriptionDB.descriptionStrings) == 'table'
+                and type(descriptionDB.descriptionSIDsByID) == 'table'),
+            tostring(descriptionDBLoadError or 'none')))
         local duplicateNames = 0
         local seenCatalogNames = {}
         for _, aa in ipairs(state.catalog) do
@@ -3265,6 +3809,10 @@ mq.bind('/aaplanner', function(...)
         for _ in pairs(state.prerequisiteCache or {}) do prereqCacheCount = prereqCacheCount + 1 end
         print(string.format('\at[AA Planner Debug]\ax PrereqSkip=%s CatalogGeneration=%d PrereqCacheEntries=%d',
             tostring(state.skipUnmetPrerequisites), tonumber(state.catalogGeneration or 0), prereqCacheCount))
+		local unresolvedSkipCount = 0
+		for _ in pairs(state.unresolvedSkips or {}) do unresolvedSkipCount = unresolvedSkipCount + 1 end
+		print(string.format('\at[AA Planner Debug]\ax SkipUnresolved=%s ActiveUnresolvedSkips=%d',
+			tostring(state.skipUnresolvedAAs), unresolvedSkipCount))
 		print(string.format('\at[AA Planner Debug]\ax AAPoints=%d QueueCost=%d QueueCostComplete=%s AutoManage=%s Pending=%s ManualQueued=%s',
 			tonumber(state.aaPoints or 0), tonumber(state.queueCost or 0), tostring(state.queueCostComplete),
 			tostring(state.autoManageActive),
@@ -3273,6 +3821,9 @@ mq.bind('/aaplanner', function(...)
         print(string.format('\at[AA Planner Debug]\ax PendingListSave=%s PendingListDelete=%s',
             state.pendingListSave and tostring(state.pendingListSave.name) or 'none',
             state.pendingListDelete and tostring(state.pendingListDelete) or 'none'))
+        print(string.format('\at[AA Planner Debug]\ax CatalogRecovery=%s RecoveryReason=%s',
+            state.catalogRecovery and tostring(state.catalogRecovery.key) or 'none',
+            state.catalogRecovery and tostring(state.catalogRecovery.reason) or 'none'))
         print(string.format('\at[AA Planner Debug]\ax SafetyChecks Casting=%s Moving=%s Navigating=%s Combat=%s AutoFire=%s XTargets=%s',
             tostring(state.safetyCheckCasting), tostring(state.safetyCheckMoving), tostring(state.safetyCheckNavigating),
             tostring(state.safetyCheckCombat), tostring(state.safetyCheckAutofire), tostring(state.safetyCheckXTargets)))
@@ -3359,6 +3910,7 @@ while open do
     -- that condition is true.
     if not state.pendingPurchase
         and state.autoSpendEnabled
+        and not state.manualSpendQueued
         and monotonicSeconds() >= (state.nextSpendAt or 0) then
         requestSpendPass(false)
     end
@@ -3381,6 +3933,10 @@ while open do
             requestSpendPass(true)
         end
     end
+
+    -- ID reads for ambiguous names select an exact AA row; purchase activity
+    -- takes priority and the descriptive wording always comes from Triune DB.
+    processAADescription()
 
     if state.dirty then
         -- Debouncing is unnecessary at this scale; persisting here protects the
